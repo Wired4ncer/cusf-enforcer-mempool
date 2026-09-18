@@ -908,6 +908,15 @@ impl Mempool {
                         anc_info.descendant_modified_weight,
                         modified_weight,
                     );
+                    if anc_info.descendant_vsize < vsize
+                        || anc_info.fees.descendant < fees.modified
+                    {
+                        tracing::error!(
+                            %txid,
+                            "ancestor package totals would underflow on \
+                             remove; descendant stats were inconsistent"
+                        );
+                    }
                     anc_info.descendant_vsize =
                         anc_info.descendant_vsize.saturating_sub(vsize);
                     anc_info.fees.descendant = anc_info
@@ -1083,11 +1092,17 @@ impl Mempool {
             tracing::trace!(%txid, "Proposing tx with ancestors");
             // stack of txs to add
             let mut to_add = vec![(txid, false)];
-            // What this package actually weighs, summed from the txs removed —
+            // What this package really costs, summed from the txs removed —
             // not from the index key, which is a cached package total that
             // can be stale or under-counted (see
-            // `recompute_package_stats_around`). The block is bounded by real
-            // weight; charging anything else can overshoot it silently.
+            // `recompute_package_stats_around`). Per tx the charge is the
+            // larger of its raw weight (what the block is bounded by) and its
+            // `modified_weight` (raw weight + the caller's tweak: the enforcer
+            // adds the weight of the M7 coinbase output that block production
+            // appends for every accepted BMM request, and nothing else
+            // reserves that space). With exact stats and a non-negative tweak
+            // this equals the old key-based charge; a negative tweak still
+            // cannot undershoot real weight.
             let mut package_weight = Weight::ZERO;
             let mut package_txids = Vec::new();
             while let Some((txid, parents_visited)) = to_add.pop() {
@@ -1096,8 +1111,10 @@ impl Mempool {
                     let (tx, info) = self
                         .remove(&txid)?
                         .expect("missing tx in mempool when proposing txs");
-                    package_weight =
-                        saturating_add_weight(package_weight, tx.weight());
+                    package_weight = saturating_add_weight(
+                        package_weight,
+                        tx.weight().max(info.modified_weight),
+                    );
                     package_txids.push(txid);
                     res.insert(txid);
                     // Remove conflicts for the final tx
@@ -1134,6 +1151,13 @@ impl Mempool {
                 );
                 for t in package_txids {
                     res.shift_remove(&t);
+                    // `remove` already pruned `t` from its descendants'
+                    // `depends`, so they would be selected as rootless
+                    // packages and `propose_txs` would then fail on the
+                    // missing ancestor — no template at all. Take them out of
+                    // this clone with their parents (tx_childs still lists
+                    // a removed tx's children).
+                    drop(self.remove_with_descendants(&t)?);
                 }
                 continue;
             }
@@ -1600,5 +1624,149 @@ mod tests {
         let template = mempool.propose_txs(None).unwrap();
         assert_eq!(template.len(), 2);
         assert_template_topologically_valid(&template, &mempool);
+    }
+
+    /// The weight guard alone: an index key that under-counts must not let a
+    /// package overshoot the limit, and a dropped package must not leave its
+    /// descendants selectable without it (that yields no template at all).
+    /// A tx with `modified_weight` far below its real weight is the cheapest
+    /// way to fake an under-counting key.
+    #[test]
+    fn weight_guard_drops_package_whose_key_undercounts_and_its_descendants() {
+        let mut mempool = test_mempool();
+        let parent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 4);
+        let p = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(p, 0)], 1);
+        let c = child.compute_txid();
+        let grandchild = make_tx(&[OutPoint::new(c, 0)], 1);
+        let g = grandchild.compute_txid();
+        let p_weight = parent.weight();
+        // Key says 4 wu; the tx really weighs p_weight.
+        mempool
+            .insert(
+                parent,
+                Amount::from_sat(5000),
+                OrdSet::new(),
+                Weight::from_wu(4),
+            )
+            .unwrap();
+        let w = child.weight();
+        mempool
+            .insert(child, Amount::from_sat(10), OrdSet::new(), w)
+            .unwrap();
+        let w = grandchild.weight();
+        mempool
+            .insert(grandchild, Amount::from_sat(10), OrdSet::new(), w)
+            .unwrap();
+        // Fits the key (4 wu) but not the real parent.
+        let limit = Weight::from_wu(p_weight.to_wu() - 1);
+        let template = mempool.propose_txs(Some(limit)).expect(
+            "a dropped package must not make propose_txs fail on a missing ancestor",
+        );
+        assert!(
+            template.is_empty(),
+            "nothing fits without the parent, got {} txs",
+            template.len()
+        );
+        // Sanity: with the key honest, the guard never trips and all propose.
+        let _ = (c, g);
+    }
+
+    /// The charge is max(raw weight, modified weight): a positive tweak (the
+    /// enforcer's +M7-output reservation per BMM request) must reserve space.
+    /// Two independent txs, each with a +192 wu tweak: the index filter alone
+    /// admits the second one whenever the first was charged at raw weight.
+    #[test]
+    fn proposal_charges_modified_weight_when_larger() {
+        let mut mempool = test_mempool();
+        let a = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let b = make_tx(&[OutPoint::new(Txid::all_zeros(), 1)], 1);
+        let w = a.weight();
+        assert_eq!(w, b.weight());
+        let tweak = Weight::from_wu(192);
+        mempool
+            .insert(a, Amount::from_sat(1000), OrdSet::new(), w + tweak)
+            .unwrap();
+        mempool
+            .insert(b, Amount::from_sat(1000), OrdSet::new(), w + tweak)
+            .unwrap();
+        // The index key rounds the modified weight up to whole vbytes.
+        let key_weight =
+            Weight::from_vb_unwrap((w + tweak).to_vbytes_ceil()).to_wu();
+        // After charging the first tx at w+tweak, the second's key must NOT
+        // fit; after charging it at w only, it does.
+        let limit = Weight::from_wu(w.to_wu() + tweak.to_wu() + key_weight - 1);
+        let template = mempool.propose_txs(Some(limit)).unwrap();
+        assert_eq!(
+            template.len(),
+            1,
+            "second tx admitted: the first was charged at raw weight, not modified"
+        );
+    }
+
+    /// `remove` on inconsistent totals must saturate, not panic: hand-corrupt
+    /// a child's ancestor stats below its parent's (and the parent's
+    /// descendant stats below the child's), then remove one of them.
+    fn corrupted_parent_child() -> (Mempool, Txid, Txid) {
+        let mut mempool = test_mempool();
+        let parent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let p = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(p, 0)], 1);
+        let c = child.compute_txid();
+        let w = parent.weight();
+        mempool
+            .insert(parent, Amount::from_sat(5000), OrdSet::new(), w)
+            .unwrap();
+        let w = child.weight();
+        mempool
+            .insert(child, Amount::from_sat(100), OrdSet::new(), w)
+            .unwrap();
+        let (_, c_info) = mempool.txs.0.get_mut(&c).unwrap();
+        let old = FeeRate {
+            fee: c_info.fees.ancestor,
+            vsize: c_info.ancestor_modified_weight.to_vbytes_ceil(),
+        };
+        mempool.by_ancestor_fee_rate.remove(old, c);
+        c_info.fees.ancestor = Amount::from_sat(100);
+        c_info.ancestor_vsize = 1;
+        let new = FeeRate {
+            fee: c_info.fees.ancestor,
+            vsize: c_info.ancestor_modified_weight.to_vbytes_ceil(),
+        };
+        mempool.by_ancestor_fee_rate.insert(new, c);
+        let (_, p_info) = mempool.txs.0.get_mut(&p).unwrap();
+        p_info.fees.descendant = Amount::from_sat(1);
+        p_info.descendant_vsize = 1;
+        (mempool, p, c)
+    }
+
+    #[test]
+    fn remove_parent_saturates_descendant_totals() {
+        // Removing the parent runs the DESCENDANTS half over the corrupted
+        // child: 100 sat - 5000 sat.
+        let (mut mempool, p, c) = corrupted_parent_child();
+        mempool
+            .remove(&p)
+            .expect("descendants-half underflow must saturate");
+        let (_, c_info) = &mempool.txs.0[&c];
+        assert_eq!(c_info.fees.ancestor, Amount::ZERO);
+        assert_eq!(c_info.ancestor_vsize, 0);
+        mempool.remove(&c).unwrap();
+        assert!(mempool.txs.0.is_empty());
+    }
+
+    #[test]
+    fn remove_child_saturates_ancestor_totals() {
+        // Removing the child runs the ANCESTORS half over the corrupted
+        // parent: 1 sat - 100 sat.
+        let (mut mempool, p, c) = corrupted_parent_child();
+        mempool
+            .remove(&c)
+            .expect("ancestors-half underflow must saturate");
+        let (_, p_info) = &mempool.txs.0[&p];
+        assert_eq!(p_info.fees.descendant, Amount::ZERO);
+        assert_eq!(p_info.descendant_vsize, 0);
+        mempool.remove(&p).unwrap();
+        assert!(mempool.txs.0.is_empty());
     }
 }
