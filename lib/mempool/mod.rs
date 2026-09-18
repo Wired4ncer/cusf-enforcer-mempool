@@ -701,7 +701,133 @@ impl Mempool {
             vsize: ancestor_modified_weight.to_vbytes_ceil(),
         };
         self.by_ancestor_fee_rate.insert(ancestor_fee_rate, txid);
+        // Out-of-order insert (descendants were already present): the
+        // incremental updates above miss the ancestor<->descendant cross
+        // terms this tx just created. Recompute both sides exactly.
+        if !direct_children.is_empty() {
+            self.recompute_package_stats_around(txid)?;
+        }
         Ok(res)
+    }
+
+    /// Transitive in-mempool descendants of `txid`, NOT including `txid`.
+    /// Walks `spent_by`, which only ever holds in-mempool children.
+    fn descendant_txids(&self, txid: Txid) -> Vec<Txid> {
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([txid]);
+        let mut res = Vec::new();
+        while let Some(t) = queue.pop_front() {
+            let Some((_, info)) = self.txs.0.get(&t) else {
+                continue;
+            };
+            for child in &info.spent_by {
+                if seen.insert(*child) {
+                    queue.push_back(*child);
+                    res.push(*child);
+                }
+            }
+        }
+        res
+    }
+
+    /// Recompute the package totals that an OUT-OF-ORDER insert of `txid`
+    /// invalidates, from scratch.
+    ///
+    /// The incremental loops in `insert` credit each pre-existing descendant
+    /// with the inserted tx alone, and each ancestor with the inserted tx
+    /// alone. But inserting the middle of a chain also joins every ancestor
+    /// of the new tx to every descendant of it: with G already in the pool,
+    /// then C (child of the absent P), then P, C's ancestor set gains P *and*
+    /// G, and G's descendant set gains P *and* C. The incremental arithmetic
+    /// left C's `ancestor_vsize` at C+P against a true package of C+P+G — an
+    /// under-counted package that `propose_txs_mut` then charges at the
+    /// wrong weight (over-weight template, i.e. an invalid block, with no
+    /// post-check) and that `remove` later subtracts below zero (panic in the
+    /// sync task). Found by the 2026-09-18 review of PR #114.
+    ///
+    /// The ancestor/descendant iterators visit each tx once, so summing over
+    /// them is exact set semantics — a descendant that already reached an
+    /// ancestor by another path is not double-counted. Only the out-of-order
+    /// path calls this; the in-order insert has no descendants and never does.
+    fn recompute_package_stats_around(
+        &mut self,
+        txid: Txid,
+    ) -> Result<(), MempoolInsertError> {
+        let (_, inserted_info) =
+            self.txs.0.get(&txid).ok_or(MissingDescendantError {
+                tx: txid,
+                missing: txid,
+            })?;
+        let inserted_conflicts = inserted_info.conflicts_with.clone();
+        // Descendants: ancestor totals + the `by_ancestor_fee_rate` key.
+        for desc_txid in self.descendant_txids(txid) {
+            let mut anc_vsize = 0u64;
+            let mut anc_weight = Weight::ZERO;
+            let mut anc_fee = Amount::ZERO;
+            let mut ancestors = self.txs.ancestors(desc_txid);
+            while let Some((_, anc_tx, anc_info)) = ancestors.next()? {
+                anc_vsize += anc_tx.vsize() as u64;
+                anc_weight =
+                    saturating_add_weight(anc_weight, anc_info.modified_weight);
+                anc_fee += anc_info.fees.modified;
+            }
+            let (desc_tx, desc_info) = self.txs.0.get_mut(&desc_txid).ok_or(
+                MissingDescendantError {
+                    tx: txid,
+                    missing: desc_txid,
+                },
+            )?;
+            let old_key = FeeRate {
+                fee: desc_info.fees.ancestor,
+                vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
+            };
+            self.by_ancestor_fee_rate.remove(old_key, desc_txid);
+            desc_info.ancestor_vsize = anc_vsize + desc_tx.vsize() as u64;
+            desc_info.ancestor_modified_weight =
+                saturating_add_weight(anc_weight, desc_info.modified_weight);
+            desc_info.fees.ancestor = anc_fee + desc_info.fees.modified;
+            desc_info.conflicts_with = desc_info
+                .conflicts_with
+                .clone()
+                .union(inserted_conflicts.clone());
+            let new_key = FeeRate {
+                fee: desc_info.fees.ancestor,
+                vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
+            };
+            self.by_ancestor_fee_rate.insert(new_key, desc_txid);
+        }
+        // Ancestors: descendant totals (no key depends on them).
+        let mut anc_ids = Vec::new();
+        let mut ancestors = self.txs.ancestors(txid);
+        while let Some((anc_txid, _, _)) = ancestors.next()? {
+            anc_ids.push(anc_txid);
+        }
+        for anc_txid in anc_ids {
+            let mut desc_vsize = 0u64;
+            let mut desc_weight = Weight::ZERO;
+            let mut desc_fee = Amount::ZERO;
+            for d in self.descendant_txids(anc_txid) {
+                let (d_tx, d_info) =
+                    self.txs.0.get(&d).ok_or(MissingDescendantError {
+                        tx: anc_txid,
+                        missing: d,
+                    })?;
+                desc_vsize += d_tx.vsize() as u64;
+                desc_weight =
+                    saturating_add_weight(desc_weight, d_info.modified_weight);
+                desc_fee += d_info.fees.modified;
+            }
+            let (anc_tx, anc_info) =
+                self.txs.0.get_mut(&anc_txid).ok_or(MissingAncestorError {
+                    tx: txid,
+                    missing: anc_txid,
+                })?;
+            anc_info.descendant_vsize = desc_vsize + anc_tx.vsize() as u64;
+            anc_info.descendant_modified_weight =
+                saturating_add_weight(desc_weight, anc_info.modified_weight);
+            anc_info.fees.descendant = desc_fee + anc_info.fees.modified;
+        }
+        Ok(())
     }
 
     /// Remove a tx from the mempool. Descendants are updated but not removed.
@@ -743,8 +869,25 @@ impl Mempool {
                     desc_info.ancestor_modified_weight,
                     modified_weight,
                 );
-                desc_info.ancestor_vsize -= vsize;
-                desc_info.fees.ancestor -= fees.modified;
+                // Saturating, never panicking: an underflow here means the
+                // package totals were already wrong, and a panic in the sync
+                // task kills the enforcer (the #611 symptom). Say so instead.
+                if desc_info.ancestor_vsize < vsize
+                    || desc_info.fees.ancestor < fees.modified
+                {
+                    tracing::error!(
+                        %txid, %desc_txid,
+                        "descendant package totals would underflow on remove; \
+                         ancestor stats were inconsistent"
+                    );
+                }
+                desc_info.ancestor_vsize =
+                    desc_info.ancestor_vsize.saturating_sub(vsize);
+                desc_info.fees.ancestor = desc_info
+                    .fees
+                    .ancestor
+                    .checked_sub(fees.modified)
+                    .unwrap_or(Amount::ZERO);
                 let ancestor_fee_rate = FeeRate {
                     fee: desc_info.fees.ancestor,
                     vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
@@ -765,8 +908,13 @@ impl Mempool {
                         anc_info.descendant_modified_weight,
                         modified_weight,
                     );
-                    anc_info.descendant_vsize -= vsize;
-                    anc_info.fees.descendant -= fees.modified;
+                    anc_info.descendant_vsize =
+                        anc_info.descendant_vsize.saturating_sub(vsize);
+                    anc_info.fees.descendant = anc_info
+                        .fees
+                        .descendant
+                        .checked_sub(fees.modified)
+                        .unwrap_or(Amount::ZERO);
                     anc_info.spent_by.remove(txid);
                     Ok(())
                 })?;
@@ -935,12 +1083,22 @@ impl Mempool {
             tracing::trace!(%txid, "Proposing tx with ancestors");
             // stack of txs to add
             let mut to_add = vec![(txid, false)];
+            // What this package actually weighs, summed from the txs removed —
+            // not from the index key, which is a cached package total that
+            // can be stale or under-counted (see
+            // `recompute_package_stats_around`). The block is bounded by real
+            // weight; charging anything else can overshoot it silently.
+            let mut package_weight = Weight::ZERO;
+            let mut package_txids = Vec::new();
             while let Some((txid, parents_visited)) = to_add.pop() {
                 if parents_visited {
                     tracing::trace!(%txid, "Removing tx from mempool");
-                    let (_tx, info) = self
+                    let (tx, info) = self
                         .remove(&txid)?
                         .expect("missing tx in mempool when proposing txs");
+                    package_weight =
+                        saturating_add_weight(package_weight, tx.weight());
+                    package_txids.push(txid);
                     res.insert(txid);
                     // Remove conflicts for the final tx
                     if to_add.is_empty() {
@@ -962,8 +1120,24 @@ impl Mempool {
                     to_add.extend(info.depends.iter().map(|dep| (*dep, false)))
                 }
             }
-            let txs_weight = Weight::from_vb_unwrap(ancestor_fee_rate.vsize);
-            weight_remaining -= txs_weight;
+            if package_weight > weight_remaining {
+                // The cached key admitted a package that does not fit. It is
+                // already out of this (cloned) mempool, so it cannot be
+                // re-selected; leave it out of the template rather than emit
+                // an over-weight block.
+                tracing::warn!(
+                    %txid,
+                    package_weight = %package_weight,
+                    key_vsize = ancestor_fee_rate.vsize,
+                    "package heavier than its index key admits; omitting it \
+                     from the block template"
+                );
+                for t in package_txids {
+                    res.shift_remove(&t);
+                }
+                continue;
+            }
+            weight_remaining -= package_weight;
         }
         Ok(res)
     }
@@ -1274,5 +1448,157 @@ mod tests {
              stale ancestor-fee-rate key",
         );
         assert!(!mempool.txs.0.contains_key(&child_txid));
+    }
+
+    /// The middle of a chain arriving LAST. G (in the pool) <- P (absent)
+    /// <- C: insert G, then C (whose only in-pool dep is none — P is absent),
+    /// then P. The incremental insert credited C with P alone and G with P
+    /// alone; the true packages are C+P+G on both sides. Found by the
+    /// 2026-09-18 review of PR #114 (defect #1).
+    fn middle_tx_arrives_last() -> (Mempool, Txid, Txid, Txid, u64, u64, u64) {
+        let mut mempool = test_mempool();
+        // A wide grandparent so the missing term is unmistakable.
+        let grandparent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 12);
+        let grandparent_txid = grandparent.compute_txid();
+        let parent = make_tx(&[OutPoint::new(grandparent_txid, 0)], 1);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], 1);
+        let child_txid = child.compute_txid();
+        let (g_vs, p_vs, c_vs) = (
+            grandparent.vsize() as u64,
+            parent.vsize() as u64,
+            child.vsize() as u64,
+        );
+        let w = grandparent.weight();
+        mempool
+            .insert(grandparent, Amount::from_sat(10), OrdSet::new(), w)
+            .unwrap();
+        let w = child.weight();
+        mempool
+            .insert(child, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+        let w = parent.weight();
+        mempool
+            .insert(parent, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+        (
+            mempool,
+            grandparent_txid,
+            parent_txid,
+            child_txid,
+            g_vs,
+            p_vs,
+            c_vs,
+        )
+    }
+
+    #[test]
+    fn middle_tx_arrives_last_package_totals_are_exact() {
+        let (mempool, g, p, c, g_vs, p_vs, c_vs) = middle_tx_arrives_last();
+        let (_, c_info) = &mempool.txs.0[&c];
+        let (_, p_info) = &mempool.txs.0[&p];
+        let (_, g_info) = &mempool.txs.0[&g];
+        assert_eq!(
+            c_info.ancestor_vsize,
+            c_vs + p_vs + g_vs,
+            "child's ancestor package must count the grandparent"
+        );
+        assert_eq!(
+            c_info.fees.ancestor,
+            Amount::from_sat(1000 + 1000 + 10),
+            "child's ancestor fees must count the grandparent"
+        );
+        assert!(c_info.depends.contains(&p), "child must depend on parent");
+        assert_eq!(p_info.ancestor_vsize, p_vs + g_vs);
+        assert_eq!(p_info.descendant_vsize, p_vs + c_vs);
+        assert_eq!(
+            g_info.descendant_vsize,
+            g_vs + p_vs + c_vs,
+            "grandparent's descendant package must count the child"
+        );
+        assert_eq!(g_info.fees.descendant, Amount::from_sat(10 + 1000 + 1000));
+        // The child's index key must be the recomputed one: a `remove` looks
+        // it up by that key and fails on a stale one.
+        let key = FeeRate {
+            fee: c_info.fees.ancestor,
+            vsize: c_info.ancestor_modified_weight.to_vbytes_ceil(),
+        };
+        assert!(
+            mempool
+                .by_ancestor_fee_rate
+                .0
+                .get(&refinement_cmp::RefinementCmp(key))
+                .is_some_and(|set| set.contains(&c)),
+            "child is not indexed under its recomputed ancestor fee rate"
+        );
+    }
+
+    #[test]
+    fn middle_tx_arrives_last_template_respects_weight_limit() {
+        let (mempool, _g, _p, _c, g_vs, p_vs, c_vs) = middle_tx_arrives_last();
+        // A limit that fits C+P but NOT C+P+G. Under-counted totals let the
+        // whole chain through (2124 wu against a 488 wu limit in the review's
+        // probe); exact totals must yield a template within the limit — and
+        // since C and P both need G, that template is empty.
+        let limit = Weight::from_vb_unwrap(c_vs + p_vs + g_vs - 1);
+        let template = mempool.propose_txs(Some(limit)).unwrap();
+        let total: u64 = template
+            .iter()
+            .map(|t| {
+                let tx: Transaction =
+                    bitcoin::consensus::deserialize(&t.data).unwrap();
+                tx.weight().to_wu()
+            })
+            .sum();
+        assert!(
+            total <= limit.to_wu(),
+            "template weight {total} exceeds the limit {}",
+            limit.to_wu()
+        );
+        assert_template_topologically_valid(&template, &mempool);
+        // And with room for all three, all three are proposed, in order.
+        let template = mempool.propose_txs(None).unwrap();
+        assert_eq!(template.len(), 3);
+        assert_template_topologically_valid(&template, &mempool);
+    }
+
+    #[test]
+    fn middle_tx_arrives_last_then_remove_does_not_underflow() {
+        // The review's second measurement: with a high-fee grandparent the
+        // under-counted child fee (`ancestor -= G.fee`) panicked with
+        // `Amount subtraction error` inside `remove` — in the sync task, on
+        // block connect. Now the totals are exact, and `remove` saturates.
+        let mut mempool = test_mempool();
+        let grandparent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 12);
+        let g = grandparent.compute_txid();
+        let parent = make_tx(&[OutPoint::new(g, 0)], 1);
+        let p = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(p, 0)], 1);
+        let c = child.compute_txid();
+        let w = grandparent.weight();
+        mempool
+            .insert(grandparent, Amount::from_sat(50_000), OrdSet::new(), w)
+            .unwrap();
+        let w = child.weight();
+        mempool
+            .insert(child, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+        let w = parent.weight();
+        mempool
+            .insert(parent, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+        // Mine G: remove it, descendants stay and are re-keyed.
+        mempool
+            .remove(&g)
+            .expect("removing the grandparent must not fail");
+        let (_, c_info) = &mempool.txs.0[&c];
+        assert_eq!(c_info.fees.ancestor, Amount::from_sat(2000));
+        let (_, p_info) = &mempool.txs.0[&p];
+        assert_eq!(p_info.fees.ancestor, Amount::from_sat(1000));
+        assert!(p_info.depends.is_empty());
+        // Then everything else proposes cleanly.
+        let template = mempool.propose_txs(None).unwrap();
+        assert_eq!(template.len(), 2);
+        assert_template_topologically_valid(&template, &mempool);
     }
 }
