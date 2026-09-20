@@ -48,6 +48,9 @@ enum RequestItem {
     RejectBlock(BlockHash),
     /// Reject a tx
     RejectTx(Txid),
+    /// Reverse an earlier `RejectTx`: the tx is being reconsidered
+    /// (see `reconsider_rejected_txs`)
+    UnrejectTx(Txid),
     /// Bool indicating if the tx is a mempool tx.
     /// `false` if the tx is needed as a dependency for a mempool tx
     Tx(Txid, bool),
@@ -57,6 +60,7 @@ enum RequestItem {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum BatchedRequestItem {
     BatchRejectTx(NonEmpty<Txid>),
+    BatchUnrejectTx(NonEmpty<Txid>),
     /// Bool indicating if the tx is a mempool tx.
     /// `false` if the tx is needed as a dependency for a mempool tx
     BatchTx(NonEmpty<(Txid, bool)>),
@@ -67,7 +71,10 @@ impl BatchedRequestItem {
     /// The bitcoind RPC method this request is dispatched as.
     fn rpc_method(&self) -> &'static str {
         match self {
-            Self::BatchRejectTx(_) | Self::Single(RequestItem::RejectTx(_)) => {
+            Self::BatchRejectTx(_)
+            | Self::BatchUnrejectTx(_)
+            | Self::Single(RequestItem::RejectTx(_))
+            | Self::Single(RequestItem::UnrejectTx(_)) => {
                 "prioritisetransaction"
             }
             Self::Single(RequestItem::RejectBlock(_)) => "invalidateblock",
@@ -91,23 +98,52 @@ struct RequestQueue {
     inner: Arc<RequestQueueInner>,
 }
 
+impl RequestItem {
+    /// The queued request this one cancels out, if any. `prioritisetransaction`
+    /// deltas ADD UP in the node, so a `RejectTx(x)` and an `UnrejectTx(x)`
+    /// that are both still queued are a no-op pair — and the queue is a set,
+    /// so pushing a second `RejectTx(x)` while an `UnrejectTx(x)` sits between
+    /// would collapse the two rejects into one RPC and leave the node at 0.
+    /// Cancelling the pending opposite keeps the node's ledger equal to ours.
+    fn opposite(&self) -> Option<RequestItem> {
+        match self {
+            Self::RejectTx(txid) => Some(Self::UnrejectTx(*txid)),
+            Self::UnrejectTx(txid) => Some(Self::RejectTx(*txid)),
+            Self::Block(_) | Self::RejectBlock(_) | Self::Tx(..) => None,
+        }
+    }
+}
+
 impl RequestQueue {
     /// Remove the request from the queue, if it exists
     fn remove(&self, request: &RequestItem) {
         self.inner.queue.lock().remove(request);
     }
 
-    /// Push the request to the back, if it does not already exist
+    /// Push the request to the back, if it does not already exist.
+    /// A pending opposite is cancelled instead (see [`RequestItem::opposite`]).
     fn push_back(&self, request: RequestItem) {
-        self.inner.queue.lock().replace(request);
+        let mut queue_lock = self.inner.queue.lock();
+        if let Some(opposite) = request.opposite()
+            && queue_lock.remove(&opposite)
+        {
+            return;
+        }
+        queue_lock.replace(request);
         if let Some(waker) = self.inner.waker.lock().take() {
             waker.wake()
         }
     }
 
-    /// Push the request to the front, if it does not already exist
+    /// Push the request to the front, if it does not already exist.
+    /// A pending opposite is cancelled instead (see [`RequestItem::opposite`]).
     fn push_front(&self, request: RequestItem) {
         let mut queue_lock = self.inner.queue.lock();
+        if let Some(opposite) = request.opposite()
+            && queue_lock.remove(&opposite)
+        {
+            return;
+        }
         queue_lock.replace(request);
         queue_lock.to_front(&request);
         if let Some(waker) = self.inner.waker.lock().take() {
@@ -143,6 +179,23 @@ impl Stream for RequestQueue {
                     ))
                 } else {
                     BatchedRequestItem::BatchRejectTx(txids)
+                };
+                Poll::Ready(Some(batched_request))
+            }
+            Some(RequestItem::UnrejectTx(txid)) => {
+                let mut txids = NonEmpty::new(txid);
+                while let Some(&RequestItem::UnrejectTx(txid)) =
+                    queue_lock.front()
+                {
+                    queue_lock.pop_front();
+                    txids.push(txid);
+                }
+                let batched_request = if txids.tail.is_empty() {
+                    BatchedRequestItem::Single(RequestItem::UnrejectTx(
+                        txids.head,
+                    ))
+                } else {
+                    BatchedRequestItem::BatchUnrejectTx(txids)
                 };
                 Poll::Ready(Some(batched_request))
             }
@@ -378,12 +431,14 @@ enum ResponseItem {
     Block(Box<bitcoin_jsonrpsee::client::Block<true>>),
     RejectBlock,
     RejectTx,
+    UnrejectTx,
 }
 
 /// Responses received while syncing
 #[derive(Clone, Debug)]
 enum BatchedResponseItem {
     BatchRejectTx,
+    BatchUnrejectTx,
     /// The outcome of a `getrawtransaction` fetch.
     ///
     /// One variant for both shapes on purpose. Fetching a single tx is just
@@ -456,7 +511,41 @@ where
 {
     const NEGATIVE_MAX_SATS: i64 = -(21_000_000 * 100_000_000);
     let method = request.rpc_method();
+    // `prioritisetransaction` deltas ADD UP, so the exact opposite of a
+    // `RejectTx` restores the tx's original standing in the node.
+    let prioritise_batch = |txids: NonEmpty<Txid>, fee_delta: i64| {
+        let mut request = BatchRequestBuilder::new();
+        for txid in txids {
+            let mut params = ObjectParams::new();
+            params.insert("txid", txid).unwrap();
+            params.insert("fee_delta", fee_delta).unwrap();
+            request.insert("prioritisetransaction", params).unwrap();
+        }
+        request
+    };
     match request {
+        BatchedRequestItem::BatchUnrejectTx(txs) => {
+            let request = prioritise_batch(txs, -NEGATIVE_MAX_SATS);
+            let _resp: Vec<bool> = rpc_client
+                .batch_request(request)
+                .boxed()
+                .await
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?
+                .into_ok()
+                .map_err(|mut errs| RequestError::JsonRpc {
+                    method,
+                    source: JsonRpcError::from(errs.next().unwrap()),
+                })?
+                .collect();
+            Ok(BatchedResponseItem::BatchUnrejectTx)
+        }
+        BatchedRequestItem::Single(RequestItem::UnrejectTx(txid)) => {
+            let _: bool = rpc_client
+                .prioritize_transaction(txid, -NEGATIVE_MAX_SATS)
+                .await
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?;
+            Ok(BatchedResponseItem::Single(ResponseItem::UnrejectTx))
+        }
         BatchedRequestItem::BatchRejectTx(txs) => {
             let mut request = BatchRequestBuilder::new();
             for txid in txs {
@@ -710,5 +799,59 @@ where
         } else {
             Poll::Pending
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use bitcoin::{Txid, hashes::Hash as _};
+
+    use super::{RequestItem, RequestQueue};
+
+    fn snapshot(q: &RequestQueue) -> Vec<RequestItem> {
+        q.inner.queue.lock().iter().copied().collect()
+    }
+
+    /// `prioritisetransaction` deltas add up and the queue is a set: a
+    /// reject and an unreject for the same tx must cancel, in either order
+    /// and from either end, or the node's ledger drifts from ours.
+    #[test]
+    fn reject_and_unreject_for_the_same_tx_cancel() {
+        let x = Txid::from_byte_array([1; 32]);
+        let y = Txid::from_byte_array([2; 32]);
+
+        let q = RequestQueue::default();
+        q.push_front(RequestItem::RejectTx(x));
+        q.push_front(RequestItem::UnrejectTx(x));
+        assert!(
+            snapshot(&q).is_empty(),
+            "unreject cancels the pending reject"
+        );
+
+        let q = RequestQueue::default();
+        q.push_front(RequestItem::UnrejectTx(x));
+        q.push_back(RequestItem::RejectTx(x));
+        assert!(
+            snapshot(&q).is_empty(),
+            "reject cancels the pending unreject"
+        );
+
+        // Only the same txid cancels; the cancelling push adds nothing.
+        let q = RequestQueue::default();
+        q.push_front(RequestItem::RejectTx(x));
+        q.push_front(RequestItem::UnrejectTx(y));
+        q.push_front(RequestItem::RejectTx(y));
+        assert_eq!(snapshot(&q), vec![RequestItem::RejectTx(x)]);
+
+        // The incident-shaped sequence: reject, reconsider (unreject), re-reject.
+        let q = RequestQueue::default();
+        q.push_front(RequestItem::RejectTx(x));
+        q.push_front(RequestItem::UnrejectTx(x));
+        q.push_front(RequestItem::RejectTx(x));
+        assert_eq!(
+            snapshot(&q),
+            vec![RequestItem::RejectTx(x)],
+            "net: one reject, as our state says"
+        );
     }
 }
