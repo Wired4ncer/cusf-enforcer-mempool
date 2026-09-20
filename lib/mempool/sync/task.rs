@@ -130,6 +130,10 @@ struct MempoolSyncInner<Enforcer> {
     /// polling. Receivers come from [`MempoolSync::subscribe_tip`].
     tip_watch: watch::Sender<BlockHash>,
     unfiltered_mempool: UnfilteredMempool,
+    /// How many times each rejected tx has been reconsidered after a block
+    /// connect (see [`reconsider_rejected_txs`]). Cleared when the tx is
+    /// admitted or leaves the node's mempool.
+    reconsider_attempts: HashMap<Txid, u8>,
 }
 
 #[derive(Debug)]
@@ -196,11 +200,14 @@ impl<Enforcer> MempoolSyncingBorrowed<'_, Enforcer> {
 }
 
 // TODO: move txs_needed / request_queue handling out
+/// Returns the rejected txs to reconsider now that the tip moved, parents
+/// before children (see [`reconsider_rejected_txs`]). The caller queues an
+/// `InsertTx` for each, in that order, at the front of the action queue.
 async fn connect_block<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: SyncStateBorrowedMut<'_>,
     block: &bitcoin_jsonrpsee::client::Block<true>,
-) -> Result<(), SyncTaskError<BorrowedEnforcer>>
+) -> Result<Vec<Txid>, SyncTaskError<BorrowedEnforcer>>
 where
     Enforcer: BorrowMut<BorrowedEnforcer>,
     BorrowedEnforcer: CusfEnforcer,
@@ -210,7 +217,7 @@ where
     if prev_blockhash != inner.unfiltered_mempool.tip {
         if block.hash == inner.unfiltered_mempool.tip {
             // Ignore, block has already been applied
-            return Ok(());
+            return Ok(Vec::new());
         }
         // A subscriber that joins while bitcoind is still flushing its ZMQ
         // notification queue receives connect events for blocks that the
@@ -229,7 +236,7 @@ where
                 tip = %inner.unfiltered_mempool.tip,
                 "Ignoring stale block connect below current tip"
             );
-            return Ok(());
+            return Ok(Vec::new());
         }
         // A disconnect for a rejected block is deliberately ignored,
         // but that skip also bypasses `handle_disconnected_block`, the
@@ -269,7 +276,7 @@ where
         sync_state
             .request_queue
             .push_front(RequestItem::RejectBlock(block.hash));
-        return Ok(());
+        return Ok(Vec::new());
     }
     let block_decoded =
         block.try_into().map_err(|err| SyncTaskError::DecodeBlock {
@@ -293,6 +300,17 @@ where
                 let txid = tx.compute_txid();
                 let _removed: Option<_> = inner.mempool.remove(&txid)?;
                 sync_state.txs_needed.remove(&txid);
+                // A tx this block mined is valid by the rules that accepted
+                // the block, whatever `accept_tx` said about it earlier (an
+                // M8 that reached us before the block it names is rejected as
+                // expired, then mined by the next block). Left in
+                // `rejected_txs`, every later spend of its outputs is refused
+                // as "rejected parent" before the enforcer is even asked —
+                // for a bidder that funds each bid from the previous bid's
+                // change, that is every bid, forever. (ecpool beta,
+                // 2026-09-19: no M8 in our template after 969,715.)
+                sync_state.rejected_txs.remove(&txid);
+                inner.reconsider_attempts.remove(&txid);
                 // The initial-sync snapshot must forget confirmed members, or
                 // a later child of this tx resolves it as a still-unconfirmed
                 // mempool parent and re-admits the mined tx from the tx cache
@@ -328,11 +346,16 @@ where
                                 "removed tx conflicting with confirmed tx",
                             );
                             inner.unfiltered_mempool.txs.remove(&removed_txid);
+                            inner.reconsider_attempts.remove(&removed_txid);
                         }
                     }
                 }
                 sync_state.tx_cache.insert(txid, tx);
             }
+            // What THIS block's connect evicts by the enforcer's own verdict
+            // (e.g. the losing bids for the parent block) is stale for this
+            // tip and must not be reconsidered in the same breath.
+            let mut evicted_now = HashSet::new();
             for txid in remove_mempool_txs {
                 inner.mempool.remove_with_descendants(&txid)?;
 
@@ -349,21 +372,105 @@ where
                     "deprioritizing tx removed by connected block",
                 );
                 sync_state.rejected_txs.insert(txid);
+                evicted_now.insert(txid);
                 sync_state
                     .request_queue
                     .push_front(RequestItem::RejectTx(txid));
             }
             inner.mempool.chain.tip = block.hash;
             let _prev: BlockHash = inner.tip_watch.send_replace(block.hash);
+            let reconsider =
+                reconsider_rejected_txs(inner, sync_state, &evicted_now);
+            tracing::debug!(
+                block_hash = %block.hash,
+                count = reconsider.len(),
+                "reconsidering rejected txs after block connect"
+            );
+            Ok(reconsider)
         }
         ConnectBlockAction::Reject => {
             sync_state.rejected_blocks.insert(block.hash);
             sync_state
                 .request_queue
                 .push_front(RequestItem::RejectBlock(block.hash));
+            Ok(Vec::new())
         }
-    };
-    Ok(())
+    }
+}
+
+/// The enforcer's verdict on a tx can depend on the chain tip: an M8 naming a
+/// block the enforcer has not connected yet is `BmmRequestExpired`, and the
+/// very same tx is valid the moment that block connects. A verdict is given
+/// once, at arrival, so a tx that the node still holds but that we rejected
+/// against an older tip would never be asked about again — it stays out of
+/// every template we build and, once mined by someone else, seeds the
+/// rejected-parent cascade (see `connect_block`).
+///
+/// After each accepted block, forget the verdict on every rejected tx the
+/// node still holds, reverse its node-side deprioritisation, and hand it back
+/// to the caller to be re-driven through `try_add_tx_from_caches`, parents
+/// before children so a re-admitted parent is in the enforced mempool before
+/// its child resolves against it (never as a rootless orphan, issue #611). A
+/// tx whose input is a rejected tx the node no longer holds cannot be valid
+/// and is left rejected. A tx the enforcer rejects again is simply rejected
+/// again (the queue cancels the pending unreject, so the node's delta is
+/// untouched); after `MAX_RECONSIDER_ATTEMPTS` re-rejections it is left
+/// alone until the node drops it — an M8 can only become valid when the exact
+/// block it names connects, which is the very next connect in the incident
+/// case, so two attempts cover it and a spammer cannot make every block cost
+/// one `accept_tx` per junk tx. `excluded` is what this same connect just
+/// evicted (stale for this tip by the enforcer's own verdict). A rejected tx
+/// whose bytes are not in `tx_cache` (a descendant pulled out of the
+/// abandoned pool) cannot be re-driven and stays rejected until mined — the
+/// same limit as before.
+fn reconsider_rejected_txs<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
+    sync_state: SyncStateBorrowedMut<'_>,
+    excluded: &HashSet<Txid>,
+) -> Vec<Txid> {
+    const MAX_RECONSIDER_ATTEMPTS: u8 = 2;
+    let mut remaining: Vec<Txid> = sync_state
+        .rejected_txs
+        .iter()
+        .copied()
+        .filter(|txid| {
+            !excluded.contains(txid)
+                && inner.unfiltered_mempool.txs.contains(txid)
+                && sync_state.tx_cache.contains_key(txid)
+                && inner.reconsider_attempts.get(txid).copied().unwrap_or(0)
+                    < MAX_RECONSIDER_ATTEMPTS
+        })
+        .collect();
+    // Deterministic order for the topological pass below.
+    remaining.sort_unstable();
+    let mut ordered = Vec::new();
+    loop {
+        let (ready, blocked): (Vec<Txid>, Vec<Txid>) =
+            remaining.into_iter().partition(|txid| {
+                sync_state.tx_cache[txid].input.iter().all(|input| {
+                    !sync_state
+                        .rejected_txs
+                        .contains(&input.previous_output.txid)
+                })
+            });
+        if ready.is_empty() {
+            break;
+        }
+        for txid in ready {
+            sync_state.rejected_txs.remove(&txid);
+            // `try_add_tx_from_caches` short-circuits on a tx already recorded
+            // in the unfiltered mirror; the re-drive puts it back.
+            inner.unfiltered_mempool.txs.remove(&txid);
+            sync_state
+                .request_queue
+                .push_front(RequestItem::UnrejectTx(txid));
+            *inner.reconsider_attempts.entry(txid).or_insert(0) += 1;
+            tracing::trace!(%txid, "reconsidering rejected tx after block connect");
+            ordered.push(txid);
+        }
+        remaining = blocked;
+    }
+    ordered
 }
 
 /// Returns `false` without applying the disconnect if the parent block must
@@ -608,7 +715,7 @@ where
                 ..
             },
         ))) if *block_hash == resp_block.hash => {
-            {
+            let reconsider = {
                 let sync_state = SyncStateBorrowedMut {
                     blocks_needed: &mut sync_state.blocks_needed,
                     rejected_blocks: &mut sync_state.rejected_blocks,
@@ -620,9 +727,14 @@ where
                     known_fees: &sync_state.known_fees,
                     mempool_txids: &mut sync_state.mempool_txids,
                 };
-                let () = connect_block(inner, sync_state, &resp_block).await?;
+                connect_block(inner, sync_state, &resp_block).await?
             };
             sync_state.action_queue.pop_front();
+            for txid in reconsider.into_iter().rev() {
+                sync_state
+                    .action_queue
+                    .push_front(SyncAction::InsertTx(txid));
+            }
         }
         Some(SyncAction::SequenceMessage(SequenceMessage::BlockHash(
             BlockHashMessage {
@@ -993,6 +1105,7 @@ where
                         Err(err) => return Err(err.into()),
                     }
                     inner.unfiltered_mempool.txs.insert(txid);
+                    inner.reconsider_attempts.remove(&txid);
                     tracing::trace!(%txid, "added tx to mempool");
                     Ok(ApplySyncActionResult::from(true))
                 }
@@ -1113,6 +1226,7 @@ where
             if inner.unfiltered_mempool.txs.remove(txid) {
                 inner.mempool.remove(txid)?;
                 inner.abandoned_pool.remove(txid);
+                inner.reconsider_attempts.remove(txid);
                 sync_state.mempool_txids.remove(txid);
                 Ok(ApplySyncActionResult::from(true))
             } else {
@@ -1131,8 +1245,11 @@ where
                 );
                 return Ok(ApplySyncActionResult::Pending);
             };
-            let () = connect_block(inner, sync_state, &block.clone()).await?;
-            Ok(ApplySyncActionResult::from(true))
+            let reconsider =
+                connect_block(inner, sync_state, &block.clone()).await?;
+            Ok(ApplySyncActionResult::Success {
+                push_txs_action_queue_front: reconsider,
+            })
         }
     }
 }
@@ -1252,8 +1369,10 @@ where
             let () = handle_resp_block(inner, sync_state, *block).await?;
         }
         BatchedResponseItem::BatchRejectTx
+        | BatchedResponseItem::BatchUnrejectTx
         | BatchedResponseItem::Single(ResponseItem::RejectBlock)
-        | BatchedResponseItem::Single(ResponseItem::RejectTx) => {}
+        | BatchedResponseItem::Single(ResponseItem::RejectTx)
+        | BatchedResponseItem::Single(ResponseItem::UnrejectTx) => {}
     }
     while try_apply_next_sync_action(inner, sync_state).await? {}
     Ok(())
@@ -1529,6 +1648,7 @@ where
     let (tip_watch, _) = watch::channel(best_block_hash);
     let inner = MempoolSyncInner {
         abandoned_pool: AbandonedPool::default(),
+        reconsider_attempts: HashMap::new(),
         enforcer,
         mempool: Mempool::new(best_block_hash),
         tip_watch,
@@ -1609,6 +1729,7 @@ where
                 mempool,
                 tip_watch,
                 unfiltered_mempool,
+                reconsider_attempts,
             } = inner.into_inner();
             MempoolSyncing {
                 inner: MempoolSyncInner {
@@ -1617,6 +1738,7 @@ where
                     mempool,
                     tip_watch,
                     unfiltered_mempool,
+                    reconsider_attempts,
                 },
                 sync_state,
             }
@@ -1672,6 +1794,7 @@ where
                         mempool,
                         tip_watch,
                         unfiltered_mempool,
+                        reconsider_attempts,
                     },
                 sync_state,
             } = inner;
@@ -1682,6 +1805,7 @@ where
                 mempool,
                 tip_watch,
                 unfiltered_mempool,
+                reconsider_attempts,
             };
             (inner, tip_rx, sync_state)
         };
@@ -1769,6 +1893,7 @@ mod tests {
         let (tip_watch, _) = watch::channel(genesis);
         let mut inner = MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
+            reconsider_attempts: HashMap::new(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -1931,6 +2056,7 @@ mod tests {
         let (tip_watch, _) = watch::channel(genesis);
         let mut inner = MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
+            reconsider_attempts: HashMap::new(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -1992,6 +2118,7 @@ mod tests {
         let (tip_watch, _) = watch::channel(genesis);
         let mut inner = MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
+            reconsider_attempts: HashMap::new(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -2069,6 +2196,7 @@ mod tests {
         let (tip_watch, _) = watch::channel(genesis);
         let mut inner = MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
+            reconsider_attempts: HashMap::new(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -2135,6 +2263,7 @@ mod tests {
         let (tip_watch, _) = watch::channel(genesis);
         MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
+            reconsider_attempts: HashMap::new(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -2649,5 +2778,595 @@ mod tests {
             !sync_state.mempool_txids.contains(&winner_txid),
             "the block-confirmed tx must be pruned from the snapshot set"
         );
+    }
+    // ------------------------------------------------------------------
+    // Incident 2026-09-19 (ecpool beta): every BMM bid rejected after
+    // 969,715. Reproduction of the two halves.
+    // ------------------------------------------------------------------
+
+    /// Rejects the listed txids until a block has been connected, then
+    /// accepts everything. Models an enforcer whose verdict depends on the
+    /// chain tip (an M8 naming a block the enforcer has not connected yet is
+    /// `BmmRequestExpired`; the same M8 is valid once that block connects).
+    struct RejectUntilBlock {
+        reject: HashSet<Txid>,
+        blocks_connected: usize,
+        /// Rejected whatever the tip (a permanently invalid tx).
+        reject_forever: HashSet<Txid>,
+        /// Returned as `remove_mempool_txs` by every `connect_block` (the
+        /// shape of the production enforcer: the losing bids for the parent).
+        remove_on_connect: HashSet<Txid>,
+    }
+
+    impl crate::cusf_enforcer::CusfEnforcer for RejectUntilBlock {
+        type InvalidBlockReason = std::convert::Infallible;
+        type SyncError = std::convert::Infallible;
+
+        async fn sync_to_tip<
+            Signal: std::future::Future<Output = ()> + Send,
+        >(
+            &mut self,
+            _shutdown_signal: Signal,
+            _tip: BlockHash,
+        ) -> Result<
+            (),
+            crate::cusf_enforcer::SyncToTipError<
+                Self::InvalidBlockReason,
+                Self::SyncError,
+            >,
+        > {
+            Ok(())
+        }
+
+        type ConnectBlockError = std::convert::Infallible;
+
+        async fn connect_block(
+            &mut self,
+            _block: &bitcoin::Block,
+        ) -> Result<
+            crate::cusf_enforcer::ConnectBlockAction,
+            Self::ConnectBlockError,
+        > {
+            self.blocks_connected += 1;
+            Ok(crate::cusf_enforcer::ConnectBlockAction::Accept {
+                remove_mempool_txs: self.remove_on_connect.clone(),
+            })
+        }
+
+        type DisconnectBlockError = std::convert::Infallible;
+
+        async fn disconnect_block(
+            &mut self,
+            _block_hash: BlockHash,
+        ) -> Result<
+            crate::cusf_enforcer::DisconnectBlockAction,
+            Self::DisconnectBlockError,
+        > {
+            Ok(crate::cusf_enforcer::DisconnectBlockAction::default())
+        }
+
+        type AcceptTxError = std::convert::Infallible;
+
+        fn accept_tx(
+            &mut self,
+            tx: &Transaction,
+        ) -> Result<crate::cusf_enforcer::TxAcceptAction, Self::AcceptTxError>
+        {
+            let txid = tx.compute_txid();
+            if self.reject_forever.contains(&txid)
+                || (self.blocks_connected == 0 && self.reject.contains(&txid))
+            {
+                Ok(crate::cusf_enforcer::TxAcceptAction::Reject)
+            } else {
+                Ok(crate::cusf_enforcer::TxAcceptAction::Accept {
+                    conflicts_with: HashSet::new(),
+                    weight_tweak: 0,
+                })
+            }
+        }
+
+        type ValidateBlockError = std::convert::Infallible;
+
+        fn validate_block(
+            &self,
+            _block: &bitcoin::Block,
+        ) -> Result<Option<String>, Self::ValidateBlockError> {
+            Ok(None)
+        }
+    }
+
+    fn inner_with(
+        enforcer: RejectUntilBlock,
+    ) -> MempoolSyncInner<RejectUntilBlock> {
+        let genesis = BlockHash::all_zeros();
+        let (tip_watch, _) = watch::channel(genesis);
+        MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            reconsider_attempts: HashMap::new(),
+            enforcer,
+            mempool: Mempool::new(genesis),
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip: genesis,
+                txs: HashSet::new(),
+            },
+        }
+    }
+
+    fn drive_insert(
+        inner: &mut MempoolSyncInner<RejectUntilBlock>,
+        sync_state: &mut SyncState,
+        txid: Txid,
+    ) -> ApplySyncActionResult {
+        let ss = SyncStateBorrowedMut {
+            blocks_needed: &mut sync_state.blocks_needed,
+            rejected_blocks: &mut sync_state.rejected_blocks,
+            rejected_txs: &mut sync_state.rejected_txs,
+            request_queue: &sync_state.request_queue,
+            tx_cache: &mut sync_state.tx_cache,
+            txs_needed: &mut sync_state.txs_needed,
+            unavailable_txs: &mut sync_state.unavailable_txs,
+            known_fees: &sync_state.known_fees,
+            mempool_txids: &mut sync_state.mempool_txids,
+        };
+        try_add_tx_from_caches::<_, RejectUntilBlock>(inner, ss, txid)
+            .expect("insert must not error")
+    }
+
+    fn drive_connect(
+        inner: &mut MempoolSyncInner<RejectUntilBlock>,
+        sync_state: &mut SyncState,
+        block: &bitcoin_jsonrpsee::client::Block<true>,
+    ) {
+        let ss = SyncStateBorrowedMut {
+            blocks_needed: &mut sync_state.blocks_needed,
+            rejected_blocks: &mut sync_state.rejected_blocks,
+            rejected_txs: &mut sync_state.rejected_txs,
+            request_queue: &sync_state.request_queue,
+            tx_cache: &mut sync_state.tx_cache,
+            txs_needed: &mut sync_state.txs_needed,
+            unavailable_txs: &mut sync_state.unavailable_txs,
+            known_fees: &sync_state.known_fees,
+            mempool_txids: &mut sync_state.mempool_txids,
+        };
+        let reconsider =
+            futures::executor::block_on(connect_block::<_, RejectUntilBlock>(
+                inner, ss, block,
+            ))
+            .expect("connect must not error");
+        // What the sync driver does with the returned list: an `InsertTx`
+        // for each, parents first.
+        for txid in reconsider {
+            let res = drive_insert(inner, sync_state, txid);
+            assert!(
+                matches!(res, ApplySyncActionResult::Success { .. }),
+                "a reconsidered tx is fully cached, so its insert terminates"
+            );
+        }
+    }
+
+    fn is_reject_queued(sync_state: &SyncState, txid: Txid) -> bool {
+        sync_state
+            .request_queue
+            .inner
+            .queue
+            .lock()
+            .contains(&RequestItem::RejectTx(txid))
+    }
+
+    /// Half 1 — the cascade. A tx the enforcer rejected on arrival is later
+    /// MINED (the enforcer accepted the block that contains it, so by the
+    /// enforcer's own rules it is valid there). Its outputs are now real
+    /// coins. A child spending one of them, which the enforcer would accept,
+    /// must be admitted. Today `rejected_txs` is never cleared and
+    /// `try_get_parent_txs_from_caches` refuses any input whose txid is in
+    /// it, so the child is rejected as "rejected parent" before `accept_tx`
+    /// is ever asked — and deprioritised in the node by -21M BTC. Observed
+    /// live: every BMM bid on ecpool beta after 969,715, because the bidder
+    /// funds each bid from the previous mined bid's change output.
+    #[test]
+    fn child_of_a_mined_parent_is_admitted_even_if_the_parent_was_once_rejected()
+     {
+        let funding = OutPoint::new(Txid::all_zeros(), 0);
+        let parent = make_tx(&[funding], &[100_000, 50_000]);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 1)], &[40_000]);
+        let child_txid = child.compute_txid();
+
+        let mut inner = inner_with(RejectUntilBlock {
+            reject: HashSet::from([parent_txid]),
+            blocks_connected: 0,
+            reject_forever: HashSet::new(),
+            remove_on_connect: HashSet::new(),
+        });
+        let mut sync_state = fresh_sync_state();
+
+        // 1. The parent arrives; the enforcer rejects it.
+        sync_state.tx_cache.insert(parent_txid, parent.clone());
+        sync_state
+            .known_fees
+            .insert(parent_txid, Amount::from_sat(1_000));
+        let res = drive_insert(&mut inner, &mut sync_state, parent_txid);
+        assert!(matches!(res, ApplySyncActionResult::Success { .. }));
+        assert!(
+            sync_state.rejected_txs.contains(&parent_txid),
+            "precondition: the parent was rejected by the enforcer"
+        );
+        assert!(
+            is_reject_queued(&sync_state, parent_txid),
+            "precondition: the parent's deprioritisation was queued"
+        );
+
+        // 2. A block mines the parent; the enforcer accepts the block.
+        let block = make_resp_block(
+            BlockHash::from_byte_array([3; 32]),
+            BlockHash::all_zeros(),
+            1,
+            &[&parent],
+        );
+        drive_connect(&mut inner, &mut sync_state, &block);
+        assert_eq!(
+            inner.mempool.chain.tip, block.hash,
+            "precondition: block connected"
+        );
+
+        // 3. The child arrives with its fee known from the node. The enforcer
+        //    accepts it (nothing about it is rejectable). It must be admitted.
+        sync_state.tx_cache.insert(child_txid, child);
+        sync_state
+            .known_fees
+            .insert(child_txid, Amount::from_sat(1_000));
+        let res = drive_insert(&mut inner, &mut sync_state, child_txid);
+        assert!(matches!(res, ApplySyncActionResult::Success { .. }));
+        assert!(
+            !sync_state.rejected_txs.contains(&child_txid),
+            "a child of a MINED parent must not be rejected as 'rejected parent'"
+        );
+        assert!(
+            !is_reject_queued(&sync_state, child_txid),
+            "the child must not be deprioritised in the node"
+        );
+        assert!(
+            inner.mempool.txs.0.contains_key(&child_txid),
+            "the child must be in the enforced mempool (and so in block templates)"
+        );
+    }
+
+    /// Half 2 — the seed. A tx the enforcer rejects only because of the
+    /// current tip (an M8 that names a block the enforcer has not connected
+    /// yet — the bidder's tx reached us before the block did) is rejected
+    /// once and never asked about again. When the block it names connects,
+    /// the enforcer would now accept it, but nothing re-evaluates it: it
+    /// stays out of the enforced mempool, stays in `rejected_txs` (seeding
+    /// half 1 once it is mined), and stays deprioritised in the node.
+    #[test]
+    fn tx_rejected_for_the_old_tip_is_reconsidered_when_the_tip_moves() {
+        let funding = OutPoint::new(Txid::all_zeros(), 0);
+        let tx = make_tx(&[funding], &[100_000]);
+        let txid = tx.compute_txid();
+
+        let mut inner = inner_with(RejectUntilBlock {
+            reject: HashSet::from([txid]),
+            blocks_connected: 0,
+            reject_forever: HashSet::new(),
+            remove_on_connect: HashSet::new(),
+        });
+        let mut sync_state = fresh_sync_state();
+        sync_state.tx_cache.insert(txid, tx.clone());
+        sync_state.known_fees.insert(txid, Amount::from_sat(1_000));
+
+        // 1. Arrives before its block: rejected against the old tip.
+        let res = drive_insert(&mut inner, &mut sync_state, txid);
+        assert!(matches!(res, ApplySyncActionResult::Success { .. }));
+        assert!(sync_state.rejected_txs.contains(&txid), "precondition");
+        assert!(!inner.mempool.txs.0.contains_key(&txid), "precondition");
+
+        // 2. The block it was waiting for connects (it does not contain the
+        //    tx). From here on the enforcer accepts it.
+        let block = make_resp_block(
+            BlockHash::from_byte_array([4; 32]),
+            BlockHash::all_zeros(),
+            1,
+            &[],
+        );
+        drive_connect(&mut inner, &mut sync_state, &block);
+        assert!(
+            matches!(
+                inner.enforcer.accept_tx(&tx),
+                Ok(crate::cusf_enforcer::TxAcceptAction::Accept { .. })
+            ),
+            "precondition: the enforcer now accepts the tx"
+        );
+
+        // 3. Still in the node's mempool, now valid: it must reach the
+        //    enforced mempool. Today nothing re-evaluates a rejected tx.
+        assert!(
+            inner.mempool.txs.0.contains_key(&txid),
+            "a tx rejected only for the old tip must be re-evaluated after the tip moves"
+        );
+        assert!(
+            !sync_state.rejected_txs.contains(&txid),
+            "and must leave rejected_txs, or it seeds the cascade when mined"
+        );
+        assert!(
+            !is_reject_queued(&sync_state, txid),
+            "the node-side deprioritisation must be reversed: the pending \
+             RejectTx is cancelled by the UnrejectTx (or an UnrejectTx is \
+             queued if the reject already went out)"
+        );
+    }
+
+    fn is_unreject_queued(sync_state: &SyncState, txid: Txid) -> bool {
+        sync_state
+            .request_queue
+            .inner
+            .queue
+            .lock()
+            .contains(&RequestItem::UnrejectTx(txid))
+    }
+
+    /// Review finding 1: what THIS connect evicts (`remove_mempool_txs`, the
+    /// losing bids for the parent block) is stale for this tip by the
+    /// enforcer's own verdict and must NOT be reconsidered in the same call —
+    /// a permissive enforcer would otherwise re-admit them into templates, and
+    /// the node's deprioritisation would be reversed.
+    #[test]
+    fn txs_evicted_by_this_connect_are_not_reconsidered_by_it() {
+        let stale = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[1_000]);
+        let stale_txid = stale.compute_txid();
+        let mut inner = inner_with(RejectUntilBlock {
+            reject: HashSet::new(),
+            blocks_connected: 0,
+            reject_forever: HashSet::new(),
+            remove_on_connect: HashSet::from([stale_txid]),
+        });
+        let mut sync_state = fresh_sync_state();
+        sync_state.tx_cache.insert(stale_txid, stale);
+        sync_state
+            .known_fees
+            .insert(stale_txid, Amount::from_sat(100));
+        // Accepted at arrival (the enforcer accepts everything here).
+        let res = drive_insert(&mut inner, &mut sync_state, stale_txid);
+        assert!(matches!(res, ApplySyncActionResult::Success { .. }));
+        assert!(
+            inner.mempool.txs.0.contains_key(&stale_txid),
+            "precondition"
+        );
+
+        let block = make_resp_block(
+            BlockHash::from_byte_array([5; 32]),
+            BlockHash::all_zeros(),
+            1,
+            &[],
+        );
+        let reconsider = {
+            let ss = SyncStateBorrowedMut {
+                blocks_needed: &mut sync_state.blocks_needed,
+                rejected_blocks: &mut sync_state.rejected_blocks,
+                rejected_txs: &mut sync_state.rejected_txs,
+                request_queue: &sync_state.request_queue,
+                tx_cache: &mut sync_state.tx_cache,
+                txs_needed: &mut sync_state.txs_needed,
+                unavailable_txs: &mut sync_state.unavailable_txs,
+                known_fees: &sync_state.known_fees,
+                mempool_txids: &mut sync_state.mempool_txids,
+            };
+            futures::executor::block_on(connect_block::<_, RejectUntilBlock>(
+                &mut inner, ss, &block,
+            ))
+            .expect("connect must not error")
+        };
+        assert!(
+            reconsider.is_empty(),
+            "the evicted tx must not be handed back for re-insert"
+        );
+        assert!(
+            sync_state.rejected_txs.contains(&stale_txid),
+            "it stays rejected"
+        );
+        assert!(
+            !inner.mempool.txs.0.contains_key(&stale_txid),
+            "and out of the enforced mempool"
+        );
+        assert!(
+            is_reject_queued(&sync_state, stale_txid),
+            "its RejectTx is still pending"
+        );
+        assert!(
+            !is_unreject_queued(&sync_state, stale_txid),
+            "and no UnrejectTx cancels it"
+        );
+    }
+
+    /// A tx the enforcer still rejects is re-rejected, the node's delta is left
+    /// alone (the pending pair cancels), and after two attempts it is no longer
+    /// reconsidered at all.
+    #[test]
+    fn a_still_invalid_tx_is_rerejected_then_left_alone() {
+        let junk = make_tx(&[OutPoint::new(Txid::all_zeros(), 1)], &[1_000]);
+        let junk_txid = junk.compute_txid();
+        let mut inner = inner_with(RejectUntilBlock {
+            reject: HashSet::new(),
+            blocks_connected: 0,
+            reject_forever: HashSet::from([junk_txid]),
+            remove_on_connect: HashSet::new(),
+        });
+        let mut sync_state = fresh_sync_state();
+        sync_state.tx_cache.insert(junk_txid, junk);
+        sync_state
+            .known_fees
+            .insert(junk_txid, Amount::from_sat(100));
+        drive_insert(&mut inner, &mut sync_state, junk_txid);
+        assert!(sync_state.rejected_txs.contains(&junk_txid), "precondition");
+        assert!(is_reject_queued(&sync_state, junk_txid), "precondition");
+        for i in 1..=3u8 {
+            let block = make_resp_block(
+                BlockHash::from_byte_array([10 + i; 32]),
+                if i == 1 {
+                    BlockHash::all_zeros()
+                } else {
+                    BlockHash::from_byte_array([9 + i; 32])
+                },
+                u32::from(i),
+                &[],
+            );
+            // drive_connect re-drives the reconsidered list, so a re-rejection
+            // lands back in rejected_txs within the same call.
+            drive_connect(&mut inner, &mut sync_state, &block);
+            assert!(
+                sync_state.rejected_txs.contains(&junk_txid),
+                "block {i}: still rejected"
+            );
+            assert!(
+                !inner.mempool.txs.0.contains_key(&junk_txid),
+                "block {i}: never admitted"
+            );
+            assert!(
+                is_reject_queued(&sync_state, junk_txid),
+                "block {i}: the node-side reject is still the pending request (unreject cancelled by the re-reject)"
+            );
+            assert!(
+                !is_unreject_queued(&sync_state, junk_txid),
+                "block {i}: no dangling unreject"
+            );
+        }
+        assert_eq!(
+            inner.reconsider_attempts.get(&junk_txid),
+            Some(&2),
+            "reconsidered exactly twice, then budget exhausted"
+        );
+    }
+
+    /// Review finding 4: the ordering contract end to end through the real
+    /// block-response path and action queue. A rejected parent and its child (rejected as "rejected
+    /// parent") are both handed back after the block; pushed to the queue as
+    /// the sync driver does, the parent is admitted first and the child then
+    /// resolves it as a present mempool parent — never as a rootless orphan.
+    #[test]
+    fn reconsidered_parent_is_applied_before_its_child_through_the_action_queue()
+     {
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000, 50_000]);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 1)], &[40_000]);
+        let child_txid = child.compute_txid();
+        let mut inner = inner_with(RejectUntilBlock {
+            reject: HashSet::from([parent_txid]),
+            blocks_connected: 0,
+            reject_forever: HashSet::new(),
+            remove_on_connect: HashSet::new(),
+        });
+        let mut sync_state = fresh_sync_state();
+        sync_state.tx_cache.insert(parent_txid, parent);
+        sync_state
+            .known_fees
+            .insert(parent_txid, Amount::from_sat(1_000));
+        sync_state.tx_cache.insert(child_txid, child);
+        sync_state
+            .known_fees
+            .insert(child_txid, Amount::from_sat(1_000));
+        drive_insert(&mut inner, &mut sync_state, parent_txid);
+        drive_insert(&mut inner, &mut sync_state, child_txid);
+        assert!(
+            sync_state.rejected_txs.contains(&parent_txid),
+            "precondition: parent rejected"
+        );
+        assert!(
+            sync_state.rejected_txs.contains(&child_txid),
+            "precondition: child rejected as rejected-parent"
+        );
+
+        let block = make_resp_block(
+            BlockHash::from_byte_array([6; 32]),
+            BlockHash::all_zeros(),
+            1,
+            &[],
+        );
+        let reconsider = {
+            let ss = SyncStateBorrowedMut {
+                blocks_needed: &mut sync_state.blocks_needed,
+                rejected_blocks: &mut sync_state.rejected_blocks,
+                rejected_txs: &mut sync_state.rejected_txs,
+                request_queue: &sync_state.request_queue,
+                tx_cache: &mut sync_state.tx_cache,
+                txs_needed: &mut sync_state.txs_needed,
+                unavailable_txs: &mut sync_state.unavailable_txs,
+                known_fees: &sync_state.known_fees,
+                mempool_txids: &mut sync_state.mempool_txids,
+            };
+            futures::executor::block_on(connect_block::<_, RejectUntilBlock>(
+                &mut inner, ss, &block,
+            ))
+            .expect("connect must not error")
+        };
+        assert_eq!(
+            reconsider,
+            vec![parent_txid, child_txid],
+            "parents before children"
+        );
+        // Undo: connect_block already moved the tips and un-rejected both. Roll
+        // the state back so the SAME block can now arrive the way production
+        // sees it — as a Connected sequence message at the head of the action
+        // queue followed by the block response — and the real push site in
+        // `handle_resp_block` is what orders the inserts.
+        inner.mempool.chain.tip = BlockHash::all_zeros();
+        inner.unfiltered_mempool.tip = BlockHash::all_zeros();
+        inner.reconsider_attempts.clear();
+        for txid in [parent_txid, child_txid] {
+            sync_state.rejected_txs.insert(txid);
+            inner.unfiltered_mempool.txs.insert(txid);
+        }
+        sync_state
+            .action_queue
+            .push_back(SyncAction::SequenceMessage(
+                SequenceMessage::BlockHash(BlockHashMessage {
+                    block_hash: block.hash,
+                    event: BlockHashEvent::Connected,
+                    zmq_seq: 1,
+                }),
+            ));
+        futures::executor::block_on(handle_resp_block::<_, RejectUntilBlock>(
+            &mut inner,
+            &mut sync_state,
+            block.clone(),
+        ))
+        .expect("block response must not error");
+        assert_eq!(inner.mempool.chain.tip, block.hash, "the block connected");
+        assert!(
+            inner.mempool.txs.0.is_empty(),
+            "nothing admitted yet: the inserts are queued, not applied"
+        );
+        let applied =
+            futures::executor::block_on(try_apply_next_sync_action::<
+                _,
+                RejectUntilBlock,
+            >(
+                &mut inner, &mut sync_state
+            ))
+            .expect("first drive must not error");
+        assert!(applied);
+        assert!(
+            inner.mempool.txs.0.contains_key(&parent_txid),
+            "the parent is admitted by the first drive"
+        );
+        assert!(
+            !inner.mempool.txs.0.contains_key(&child_txid),
+            "the child is not yet applied"
+        );
+        let applied =
+            futures::executor::block_on(try_apply_next_sync_action::<
+                _,
+                RejectUntilBlock,
+            >(
+                &mut inner, &mut sync_state
+            ))
+            .expect("second drive must not error");
+        assert!(applied);
+        assert!(
+            inner.mempool.txs.0.contains_key(&child_txid),
+            "the child is admitted with its parent present"
+        );
+        assert!(sync_state.action_queue.is_empty());
+        assert!(sync_state.rejected_txs.is_empty());
     }
 }
