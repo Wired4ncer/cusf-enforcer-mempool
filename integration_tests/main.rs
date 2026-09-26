@@ -9,7 +9,7 @@ use cusf_enforcer_mempool_integration_tests::{
     test_disconnect_through_sync_tip, test_double_insert_after_reorg,
     test_enforcer_rejection_during_reorg, test_gbt_long_poll,
     test_invalid_block_during_initial_sync, test_mempool_dat_fast_path,
-    test_orphan_admitted_after_disconnect_removal,
+    test_mined_rejected_parent, test_orphan_admitted_after_disconnect_removal,
     test_orphan_admitted_after_enforcer_removal,
     test_rbf_removed_for_absent_tx, test_rejected_block_disconnect,
     test_reorg_re_inserts_tx, test_reorg_reinserts_parent_under_child,
@@ -249,6 +249,9 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
             Box::pin(
                 test_orphan_admitted_after_disconnect_removal::test_orphan_admitted_after_disconnect_removal(s),
             )
+        }),
+        ("mined_rejected_parent", |s| {
+            Box::pin(test_mined_rejected_parent::test_mined_rejected_parent(s))
         }),
         ("orphan_admitted_after_enforcer_removal", |s| {
             Box::pin(
