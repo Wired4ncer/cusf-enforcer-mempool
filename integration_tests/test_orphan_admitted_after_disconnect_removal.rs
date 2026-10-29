@@ -87,10 +87,18 @@ pub async fn test_orphan_admitted_after_disconnect_removal(
 
     let template = local_block_template(&setup.mempool_sync).await?;
     let txids: Vec<Txid> = template.iter().map(|t| t.txid).collect();
+    // Our fork (ecpool): a disconnect removal is a tip-dependent verdict, so
+    // after the next connect the removed txs the node still holds are asked
+    // about again (`reconsider_rejected_txs`) and may come back — parents
+    // first. What must never happen is the orphan this test was written for:
+    // the grandchild proposed without the package it spends. Whether the
+    // re-ask happened and is honoured both ways is pinned by
+    // `disconnect_removal_reask_{accepts,rejects}`.
     anyhow::ensure!(
-        !txids.contains(&grandchild),
-        "grandchild {grandchild} was admitted though its parent {child} was \
-         removed with {parent} at disconnect; template holds {txids:?}"
+        !txids.contains(&grandchild)
+            || (txids.contains(&parent) && txids.contains(&child)),
+        "grandchild {grandchild} was admitted without its ancestors {child} / \
+         {parent} (removed at disconnect); template holds {txids:?}"
     );
 
     let violations = template_violations(rpc, &template).await?;

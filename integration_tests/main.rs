@@ -6,9 +6,10 @@ use cusf_enforcer_mempool_integration_tests::{
     test_accept_tx_paths, test_block_connect_smoke,
     test_conflict_eviction_at_block_connect,
     test_connect_block_deprioritizes_removed_txs,
-    test_disconnect_through_sync_tip, test_double_insert_after_reorg,
-    test_enforcer_rejection_during_reorg, test_gbt_long_poll,
-    test_invalid_block_during_initial_sync, test_mempool_dat_fast_path,
+    test_disconnect_removal_reask, test_disconnect_through_sync_tip,
+    test_double_insert_after_reorg, test_enforcer_rejection_during_reorg,
+    test_gbt_long_poll, test_invalid_block_during_initial_sync,
+    test_mempool_dat_fast_path, test_mined_rejected_parent,
     test_orphan_admitted_after_disconnect_removal,
     test_orphan_admitted_after_enforcer_removal,
     test_rbf_removed_for_absent_tx, test_rejected_block_disconnect,
@@ -248,6 +249,19 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
         ("orphan_admitted_after_disconnect_removal", |s| {
             Box::pin(
                 test_orphan_admitted_after_disconnect_removal::test_orphan_admitted_after_disconnect_removal(s),
+            )
+        }),
+        ("mined_rejected_parent", |s| {
+            Box::pin(test_mined_rejected_parent::test_mined_rejected_parent(s))
+        }),
+        ("disconnect_removal_reask_accepts", |s| {
+            Box::pin(
+                test_disconnect_removal_reask::test_disconnect_removal_reask_accepts(s),
+            )
+        }),
+        ("disconnect_removal_reask_rejects", |s| {
+            Box::pin(
+                test_disconnect_removal_reask::test_disconnect_removal_reask_rejects(s),
             )
         }),
         ("orphan_admitted_after_enforcer_removal", |s| {
