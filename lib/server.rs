@@ -167,6 +167,7 @@ impl CachedBlockTemplates {
         coinbasetxn: bool,
         now: DateTime<Utc>,
         tip_block_hash: BlockHash,
+        wake_gen: u64,
     ) -> Option<Box<BlockTemplate>> {
         let (block_template, generated_ts) = if coinbasetxn {
             self.coinbasetxn
@@ -177,7 +178,15 @@ impl CachedBlockTemplates {
         if age > self.cache_lifetime {
             return None;
         }
-        if tip_block_hash == block_template.prev_blockhash {
+        // A template from before a wake lacks what the wake was for, and its
+        // `longpollid` would make the client's next long-poll return at once.
+        let built_at_wake_gen = block_template
+            .long_poll_id
+            .as_deref()
+            .and_then(parse_long_poll_wake_gen);
+        if tip_block_hash == block_template.prev_blockhash
+            && built_at_wake_gen == Some(wake_gen)
+        {
             Some(block_template)
         } else {
             None
@@ -211,12 +220,99 @@ pub enum CreateServerError {
 const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A `longpollid` is the tip hash the template was built on followed by
-/// a monotonic sequence number. The suffix makes the id unique per
-/// template-build event, as BIP22 requires. Without it, a
+/// a monotonic sequence number and the [`TemplateWake`] generation the
+/// template was built at (16 hex digits each). The sequence number makes the
+/// id unique per template-build event, as BIP22 requires. Without it, a
 /// timeout return would reuse the previous id for a different (refreshed)
 /// template. Clients treat the whole string as opaque, per the BIP.
 fn parse_long_poll_tip(long_poll_id: &str) -> Option<BlockHash> {
     long_poll_id.get(..64)?.parse().ok()
+}
+
+/// The [`TemplateWake`] generation a `longpollid` was built at, see
+/// [`parse_long_poll_tip`]. `None` for an id without one.
+fn parse_long_poll_wake_gen(long_poll_id: &str) -> Option<u64> {
+    let gen_hex = long_poll_id.get(80..96)?;
+    if long_poll_id.len() != 96 {
+        return None;
+    }
+    u64::from_str_radix(gen_hex, 16).ok()
+}
+
+/// Lets the block producer cut a BIP22 long-poll short when the template
+/// should change although the tip has not, e.g. when a BMM request (M8) for
+/// the current tip enters the mempool: such a request is only valid for the
+/// next block, so waiting for the tip change or the timeout would miss it.
+///
+/// Each [`Self::wake`] bumps a generation counter. Every template carries the
+/// generation it was built at in its `longpollid`, and a long-poll returns as
+/// soon as the generation differs from that one, so a wake between two
+/// requests is not lost, and a burst of wakes costs at most one extra
+/// template per client (the next template carries the newest generation).
+#[derive(Clone, Debug)]
+pub struct TemplateWake(std::sync::Arc<tokio::sync::watch::Sender<u64>>);
+
+impl TemplateWake {
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::watch::Sender::new(0)))
+    }
+
+    /// Ask parked long-polls to return a fresh template now.
+    pub fn wake(&self) {
+        self.0
+            .send_modify(|wake_gen| *wake_gen = wake_gen.wrapping_add(1));
+    }
+
+    /// Observe the wake generation.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.0.subscribe()
+    }
+}
+
+impl Default for TemplateWake {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Park a long-poll whose template was built on `long_poll_tip` at wake
+/// generation `long_poll_wake_gen` until the tip changes, the wake generation
+/// differs from `long_poll_wake_gen`, or `timeout` passes, whichever is
+/// first. `wait_for` checks the current value before waiting, so a change
+/// between building the previous template and parking is not missed. With no
+/// `long_poll_wake_gen` (an id from before wakes existed), the generation at
+/// the time of parking is used.
+async fn long_poll_wait(
+    mut tip_rx: tokio::sync::watch::Receiver<BlockHash>,
+    wake_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    long_poll_tip: BlockHash,
+    long_poll_wake_gen: Option<u64>,
+    timeout: Duration,
+) {
+    let tip_changed = tip_rx.wait_for(|tip| *tip != long_poll_tip);
+    let woken = async {
+        match wake_rx {
+            Some(mut wake_rx) => {
+                let parked_gen =
+                    long_poll_wake_gen.unwrap_or_else(|| *wake_rx.borrow());
+                // A closed channel never wakes: fall back to tip/timeout.
+                if wake_rx.wait_for(|g| *g != parked_gen).await.is_err() {
+                    std::future::pending::<()>().await
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let _timed_out: Result<(), tokio::time::error::Elapsed> =
+        tokio::time::timeout(
+            timeout,
+            futures::future::select(
+                std::pin::pin!(tip_changed),
+                std::pin::pin!(woken),
+            ),
+        )
+        .await
+        .map(|_| ());
 }
 
 pub struct Server<Enforcer, RpcClient> {
@@ -233,6 +329,9 @@ pub struct Server<Enforcer, RpcClient> {
     tip_rx: tokio::sync::watch::Receiver<BlockHash>,
     /// Uniquifying suffix for `longpollid`s, see [`parse_long_poll_tip`].
     long_poll_seq: AtomicU64,
+    /// Generation observer of the producer's [`TemplateWake`], if any, see
+    /// [`Self::with_template_wake`].
+    wake_rx: Option<tokio::sync::watch::Receiver<u64>>,
 }
 
 impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
@@ -273,7 +372,19 @@ impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
             known_targets: parking_lot::RwLock::new(HashMap::new()),
             tip_rx,
             long_poll_seq: AtomicU64::new(0),
+            wake_rx: None,
         })
+    }
+
+    /// Let `template_wake` cut long-polls short, see [`TemplateWake`].
+    pub fn with_template_wake(mut self, template_wake: &TemplateWake) -> Self {
+        self.wake_rx = Some(template_wake.subscribe());
+        self
+    }
+
+    /// Current [`TemplateWake`] generation, 0 without one.
+    fn wake_gen(&self) -> u64 {
+        self.wake_rx.as_ref().map_or(0, |wake_rx| *wake_rx.borrow())
     }
 }
 
@@ -900,25 +1011,29 @@ where
         const NONCE_RANGE: [u8; 8] = [0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
 
         // BIP22 long polling: when the request carries the longpollid of the
-        // tip we are currently on, park it until the tip changes, then fall
-        // through and serve a template for the new tip. A stale or
-        // unparseable longpollid returns immediately. The timeout return
-        // serves a refreshed template (new curtime / tx set) for the same
-        // tip. `wait_for` checks the current value before waiting, so a tip
-        // change between parsing and parking is not missed.
+        // tip we are currently on, park it until the tip changes or the
+        // producer's `TemplateWake` fires, then fall through and serve a
+        // fresh template. A stale or unparseable longpollid returns
+        // immediately. The timeout return serves a refreshed template (new
+        // curtime / tx set) for the same tip. See `long_poll_wait`.
         if let Some(long_poll_id) = &request.long_poll_id
             && let Some(long_poll_tip) = parse_long_poll_tip(long_poll_id)
         {
-            let mut tip_rx = self.tip_rx.clone();
-            let _wait_result: Result<
-                Result<_, _>,
-                tokio::time::error::Elapsed,
-            > = tokio::time::timeout(
+            long_poll_wait(
+                self.tip_rx.clone(),
+                self.wake_rx.clone(),
+                long_poll_tip,
+                parse_long_poll_wake_gen(long_poll_id),
                 LONG_POLL_TIMEOUT,
-                tip_rx.wait_for(|tip| *tip != long_poll_tip),
             )
             .await;
         }
+        // Read before the mempool is queried: a wake fires while the mempool
+        // sync holds the write lock it inserts the tx under, so a template
+        // built at generation `wake_gen` contains every tx whose wake made
+        // the generation `wake_gen` or lower. A wake racing this read at
+        // worst yields one extra template.
+        let wake_gen = self.wake_gen();
 
         let now = Utc::now();
         let BlockTemplate {
@@ -956,6 +1071,7 @@ where
                                 coinbasetxn,
                                 now,
                                 mempool.tip().hash,
+                                wake_gen,
                             )
                     {
                         Ok(CachedMempoolQueryOutput::Cached(
@@ -1072,7 +1188,7 @@ where
             coinbase_aux: coinbase_aux.clone(),
             coinbase_txn_or_value,
             long_poll_id: Some(format!(
-                "{prev_blockhash}{:016x}",
+                "{prev_blockhash}{:016x}{wake_gen:016x}",
                 self.long_poll_seq.fetch_add(1, Ordering::Relaxed)
             )),
             target: target.to_be_bytes(),
@@ -1153,6 +1269,108 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod long_poll_wake {
+        use std::time::Instant;
+
+        use bitcoin::hashes::Hash as _;
+
+        use super::*;
+
+        const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+        fn tip(byte: u8) -> BlockHash {
+            BlockHash::from_byte_array([byte; 32])
+        }
+
+        /// Park a long-poll on tip 1 built at wake generation `parked_gen`,
+        /// run `act` after 200 ms, and return how long the poll was parked.
+        async fn parked_for(
+            template_wake: &TemplateWake,
+            parked_gen: Option<u64>,
+            act: impl FnOnce(),
+        ) -> Duration {
+            let (_tip_tx, tip_rx) = tokio::sync::watch::channel(tip(1));
+            let start = Instant::now();
+            let wait = tokio::spawn(long_poll_wait(
+                tip_rx,
+                Some(template_wake.subscribe()),
+                tip(1),
+                parked_gen,
+                TEST_TIMEOUT,
+            ));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            act();
+            wait.await.unwrap();
+            start.elapsed()
+        }
+
+        #[tokio::test]
+        async fn wake_returns_parked_long_poll() {
+            let template_wake = TemplateWake::new();
+            let parked =
+                parked_for(&template_wake, Some(0), || template_wake.wake())
+                    .await;
+            assert!(parked < Duration::from_secs(1), "parked {parked:?}");
+        }
+
+        #[tokio::test]
+        async fn no_wake_parks_until_timeout() {
+            let template_wake = TemplateWake::new();
+            let parked = parked_for(&template_wake, Some(0), || ()).await;
+            assert!(parked >= TEST_TIMEOUT, "parked {parked:?}");
+        }
+
+        /// A wake between building the template and parking its long-poll
+        /// is not lost: the poll returns at once.
+        #[tokio::test]
+        async fn wake_before_parking_returns_at_once() {
+            let template_wake = TemplateWake::new();
+            template_wake.wake();
+            let parked = parked_for(&template_wake, Some(0), || ()).await;
+            assert!(parked < Duration::from_secs(1), "parked {parked:?}");
+        }
+
+        /// A poll parked at the newest generation is not woken by older
+        /// wakes (no spin after a burst).
+        #[tokio::test]
+        async fn current_gen_parks() {
+            let template_wake = TemplateWake::new();
+            for _ in 0..5 {
+                template_wake.wake();
+            }
+            let parked = parked_for(&template_wake, Some(5), || ()).await;
+            assert!(parked >= TEST_TIMEOUT, "parked {parked:?}");
+        }
+
+        #[tokio::test]
+        async fn tip_change_still_returns() {
+            let template_wake = TemplateWake::new();
+            let (tip_tx, tip_rx) = tokio::sync::watch::channel(tip(1));
+            let start = Instant::now();
+            let wait = tokio::spawn(long_poll_wait(
+                tip_rx,
+                Some(template_wake.subscribe()),
+                tip(1),
+                Some(0),
+                TEST_TIMEOUT,
+            ));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tip_tx.send(tip(2)).unwrap();
+            wait.await.unwrap();
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn long_poll_id_round_trip() {
+            let id = format!("{}{:016x}{:016x}", tip(7), 3u64, 42u64);
+            assert_eq!(parse_long_poll_tip(&id), Some(tip(7)));
+            assert_eq!(parse_long_poll_wake_gen(&id), Some(42));
+            let old_id = format!("{}{:016x}", tip(7), 3u64);
+            assert_eq!(parse_long_poll_tip(&old_id), Some(tip(7)));
+            assert_eq!(parse_long_poll_wake_gen(&old_id), None);
+        }
+    }
 
     /// A block consists of the header, the txs array length, the coinbase tx,
     /// and the txs selected within `MAX_USABLE_BLOCK_WEIGHT`, so the weight

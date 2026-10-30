@@ -32,6 +32,9 @@ typewit = { workspace = true }
 ulid = { workspace = true }
 zeromq = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
 [lints]
 workspace = true
 
