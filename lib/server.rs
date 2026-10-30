@@ -239,33 +239,99 @@ fn parse_long_poll_wake_gen(long_poll_id: &str) -> Option<u64> {
     u64::from_str_radix(gen_hex, 16).ok()
 }
 
+/// At most one [`TemplateWake`] generation bump per this interval. Each bump
+/// makes every parked long-poll return and bypasses the template cache, and
+/// bitcoind relays M8-shaped txs for the minimum relay fee, so wakes must not
+/// be a way to flood every client (and through the pool every miner) with new
+/// templates.
+pub const MIN_WAKE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Lets the block producer cut a BIP22 long-poll short when the template
 /// should change although the tip has not, e.g. when a BMM request (M8) for
 /// the current tip enters the mempool: such a request is only valid for the
 /// next block, so waiting for the tip change or the timeout would miss it.
 ///
-/// Each [`Self::wake`] bumps a generation counter. Every template carries the
-/// generation it was built at in its `longpollid`, and a long-poll returns as
-/// soon as the generation differs from that one, so a wake between two
-/// requests is not lost, and a burst of wakes costs at most one extra
-/// template per client (the next template carries the newest generation).
+/// Each [`Self::wake`] bumps a generation counter, at most once per
+/// [`MIN_WAKE_INTERVAL`]: a wake inside the interval is deferred to its end,
+/// and any further wakes before then are folded into that one. So a burst
+/// costs at most one wake-driven template per client per interval, while the
+/// first wake after a quiet spell takes effect at once. Every template
+/// carries the generation it was built at in its `longpollid`, and a
+/// long-poll returns as soon as the generation differs from that one, so a
+/// wake between two requests is not lost. Tip changes are not affected.
 #[derive(Clone, Debug)]
-pub struct TemplateWake(std::sync::Arc<tokio::sync::watch::Sender<u64>>);
+pub struct TemplateWake(std::sync::Arc<TemplateWakeInner>);
+
+#[derive(Debug)]
+struct TemplateWakeInner {
+    wake_gen: tokio::sync::watch::Sender<u64>,
+    state: parking_lot::Mutex<TemplateWakeState>,
+}
+
+#[derive(Debug, Default)]
+struct TemplateWakeState {
+    /// When the generation was last bumped.
+    last_bump: Option<std::time::Instant>,
+    /// A bump is scheduled for the end of the current interval.
+    deferred: bool,
+}
 
 impl TemplateWake {
     pub fn new() -> Self {
-        Self(std::sync::Arc::new(tokio::sync::watch::Sender::new(0)))
+        Self(std::sync::Arc::new(TemplateWakeInner {
+            wake_gen: tokio::sync::watch::Sender::new(0),
+            state: parking_lot::Mutex::default(),
+        }))
     }
 
-    /// Ask parked long-polls to return a fresh template now.
+    /// Ask parked long-polls to return a fresh template, now or, within
+    /// [`MIN_WAKE_INTERVAL`] of the last bump, at the end of the interval.
     pub fn wake(&self) {
-        self.0
+        let mut state = self.0.state.lock();
+        if state.deferred {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = state.last_bump.map(|last| last + MIN_WAKE_INTERVAL);
+        match due {
+            Some(due) if now < due => {
+                // Outside a runtime there is no timer to defer to; bump now
+                // rather than lose the wake.
+                let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                    Self::bump(&self.0, &mut state, now);
+                    return;
+                };
+                state.deferred = true;
+                let inner = std::sync::Arc::clone(&self.0);
+                drop(state);
+                runtime.spawn(async move {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(
+                        due,
+                    ))
+                    .await;
+                    let mut state = inner.state.lock();
+                    state.deferred = false;
+                    Self::bump(&inner, &mut state, std::time::Instant::now());
+                });
+            }
+            _ => Self::bump(&self.0, &mut state, now),
+        }
+    }
+
+    fn bump(
+        inner: &TemplateWakeInner,
+        state: &mut TemplateWakeState,
+        now: std::time::Instant,
+    ) {
+        state.last_bump = Some(now);
+        inner
+            .wake_gen
             .send_modify(|wake_gen| *wake_gen = wake_gen.wrapping_add(1));
     }
 
     /// Observe the wake generation.
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.0.subscribe()
+        self.0.wake_gen.subscribe()
     }
 }
 
@@ -1339,7 +1405,11 @@ mod tests {
             for _ in 0..5 {
                 template_wake.wake();
             }
-            let parked = parked_for(&template_wake, Some(5), || ()).await;
+            // One bump at once, the other four folded into one deferred bump.
+            tokio::time::sleep(MIN_WAKE_INTERVAL + Duration::from_millis(200))
+                .await;
+            assert_eq!(*template_wake.subscribe().borrow(), 2);
+            let parked = parked_for(&template_wake, Some(2), || ()).await;
             assert!(parked >= TEST_TIMEOUT, "parked {parked:?}");
         }
 
@@ -1359,6 +1429,64 @@ mod tests {
             tip_tx.send(tip(2)).unwrap();
             wait.await.unwrap();
             assert!(start.elapsed() < Duration::from_secs(1));
+        }
+
+        /// A burst of wakes bumps the generation once at once and once more
+        /// at the end of `MIN_WAKE_INTERVAL`, so a long-poll parked on the
+        /// first bump is held for the rest of the interval.
+        #[tokio::test]
+        async fn wake_burst_is_coalesced() {
+            let template_wake = TemplateWake::new();
+            let wake_rx = template_wake.subscribe();
+            let burst_start = Instant::now();
+            for _ in 0..10 {
+                template_wake.wake();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(*wake_rx.borrow(), 1, "first wake is immediate");
+            let (_tip_tx, tip_rx) = tokio::sync::watch::channel(tip(1));
+            long_poll_wait(
+                tip_rx,
+                Some(template_wake.subscribe()),
+                tip(1),
+                Some(1),
+                TEST_TIMEOUT,
+            )
+            .await;
+            let held = burst_start.elapsed();
+            assert!(
+                held >= Duration::from_millis(900)
+                    && held < Duration::from_millis(1500),
+                "wake-driven return after {held:?}"
+            );
+            assert_eq!(*wake_rx.borrow(), 2, "the rest fold into one bump");
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            assert_eq!(*wake_rx.borrow(), 2, "no further bumps");
+        }
+
+        /// A tip change returns at once, even while wakes are held back.
+        #[tokio::test]
+        async fn tip_change_returns_during_wake_hold() {
+            let template_wake = TemplateWake::new();
+            template_wake.wake();
+            template_wake.wake(); // deferred to the end of the interval
+            let (tip_tx, tip_rx) = tokio::sync::watch::channel(tip(1));
+            let start = Instant::now();
+            let wait = tokio::spawn(long_poll_wait(
+                tip_rx,
+                Some(template_wake.subscribe()),
+                tip(1),
+                Some(1),
+                TEST_TIMEOUT,
+            ));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tip_tx.send(tip(2)).unwrap();
+            wait.await.unwrap();
+            assert!(
+                start.elapsed() < Duration::from_millis(500),
+                "parked {:?}",
+                start.elapsed()
+            );
         }
 
         #[test]
@@ -1411,6 +1539,330 @@ mod tests {
                 block_weight <= Weight::MAX_BLOCK,
                 "weight `{block_weight}` exceeds limit for {spk_len}-byte spk"
             );
+        }
+    }
+
+    /// `Server::build_block_template` with wakes, over a mempool with no
+    /// sync task and no node behind the RPC client.
+    mod server_wake {
+        use std::{
+            collections::HashSet, sync::atomic::AtomicBool, time::Instant,
+        };
+
+        use bitcoin::{
+            Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid,
+            Witness, absolute::LockTime, hashes::Hash as _,
+            transaction::Version,
+        };
+        use bitcoin_jsonrpsee::client::Block;
+
+        use super::*;
+        use crate::{
+            cusf_block_producer::{CoinbaseTxn, typewit},
+            cusf_enforcer::{
+                ConnectBlockAction, CusfEnforcer, DefaultEnforcer,
+                DisconnectBlockAction, SyncToTipError, TxAcceptAction,
+            },
+        };
+
+        /// `DefaultEnforcer` that, if armed, wakes once while a template is
+        /// being built: a wake landing after the mempool was queried.
+        struct WakeDuringQuery(Option<(TemplateWake, AtomicBool)>);
+
+        impl CusfEnforcer for WakeDuringQuery {
+            type InvalidBlockReason = std::convert::Infallible;
+            type SyncError = std::convert::Infallible;
+
+            async fn sync_to_tip<Signal: Future<Output = ()> + Send>(
+                &mut self,
+                _shutdown_signal: Signal,
+                _block_hash: BlockHash,
+            ) -> Result<
+                (),
+                SyncToTipError<Self::InvalidBlockReason, Self::SyncError>,
+            > {
+                Ok(())
+            }
+
+            type ConnectBlockError = std::convert::Infallible;
+
+            async fn connect_block(
+                &mut self,
+                _block: &bitcoin::Block,
+            ) -> Result<ConnectBlockAction, Self::ConnectBlockError>
+            {
+                Ok(ConnectBlockAction::default())
+            }
+
+            type DisconnectBlockError = std::convert::Infallible;
+
+            async fn disconnect_block(
+                &mut self,
+                _block_hash: BlockHash,
+            ) -> Result<DisconnectBlockAction, Self::DisconnectBlockError>
+            {
+                Ok(DisconnectBlockAction::default())
+            }
+
+            type AcceptTxError = std::convert::Infallible;
+
+            fn accept_tx(
+                &mut self,
+                tx: &Transaction,
+            ) -> Result<TxAcceptAction, Self::AcceptTxError> {
+                DefaultEnforcer.accept_tx(tx)
+            }
+
+            type ValidateBlockError = std::convert::Infallible;
+
+            fn validate_block(
+                &self,
+                _block: &bitcoin::Block,
+            ) -> Result<Option<String>, Self::ValidateBlockError> {
+                Ok(None)
+            }
+        }
+
+        impl CusfBlockProducer for WakeDuringQuery {
+            type InitialBlockTemplateError = std::convert::Infallible;
+
+            async fn initial_block_template<const COINBASE_TXN: bool>(
+                &self,
+                _parent_block_hash: &BlockHash,
+                _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
+                _template: &mut InitialBlockTemplate<COINBASE_TXN>,
+            ) -> Result<(), Self::InitialBlockTemplateError>
+            where
+                typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
+            {
+                Ok(())
+            }
+
+            type FinalizeBlockTemplateError = std::convert::Infallible;
+
+            async fn finalize_block_template<const COINBASE_TXN: bool>(
+                &self,
+                _parent_block_hash: &BlockHash,
+                _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
+                _template: &mut FilledBlockTemplate<COINBASE_TXN>,
+            ) -> Result<(), Self::FinalizeBlockTemplateError>
+            where
+                typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
+            {
+                if let Some((template_wake, fired)) = &self.0
+                    && !fired.swap(true, Ordering::SeqCst)
+                {
+                    template_wake.wake();
+                }
+                Ok(())
+            }
+        }
+
+        type TestServer =
+            Server<WakeDuringQuery, bitcoin_jsonrpsee::http_client::HttpClient>;
+
+        fn tip_block() -> Block<true> {
+            Block {
+                hash: BlockHash::from_byte_array([9; 32]),
+                confirmations: 1,
+                strippedsize: 0,
+                size: 0,
+                weight: 0,
+                height: 100,
+                version: bitcoin::block::Version::TWO,
+                version_hex: String::new(),
+                merkleroot: bitcoin::TxMerkleNode::all_zeros(),
+                tx: Vec::new(),
+                time: 0,
+                mediantime: 0,
+                nonce: 0,
+                compact_target: bitcoin::CompactTarget::from_consensus(
+                    0x207f_ffff,
+                ),
+                difficulty: 1.0,
+                chainwork: String::new(),
+                previousblockhash: None,
+                nextblockhash: None,
+            }
+        }
+
+        fn sample_block_template() -> BlockTemplate {
+            BlockTemplate {
+                capabilities: Vec::new(),
+                version: bitcoin::block::Version::TWO,
+                rules: vec!["segwit".to_owned()],
+                version_bits_available: Default::default(),
+                version_bits_required: bitcoin::block::Version::from_consensus(
+                    0,
+                ),
+                prev_blockhash: tip_block().hash,
+                transactions: Vec::new(),
+                coinbase_aux: Default::default(),
+                coinbase_txn_or_value: CoinbaseTxnOrValue::ValueSats(0),
+                long_poll_id: None,
+                target: [0xff; 32],
+                mintime: 0,
+                mutable: Vec::new(),
+                nonce_range: [0; 8],
+                sigop_limit: 80_000,
+                size_limit: 4_000_000,
+                weight_limit: Weight::MAX_BLOCK,
+                current_time: 0,
+                compact_target: bitcoin::CompactTarget::from_consensus(
+                    0x207f_ffff,
+                ),
+                height: 101,
+                signet_challenge: None,
+                default_witness_commitment: None,
+            }
+        }
+
+        /// A cached server (templates live for 60 s) with `template_wake`.
+        fn server(
+            enforcer: WakeDuringQuery,
+            template_wake: &TemplateWake,
+        ) -> TestServer {
+            let mempool = MempoolSync::for_test(
+                enforcer,
+                Mempool::with_tip_for_test(tip_block()),
+            );
+            // Never called: the target is known below.
+            let rpc_client =
+                bitcoin_jsonrpsee::http_client::HttpClientBuilder::default()
+                    .build("http://127.0.0.1:1")
+                    .unwrap();
+            let server = Server::new(
+                ScriptBuf::new(),
+                mempool,
+                Network::Regtest,
+                NetworkInfo { time_offset_s: 0 },
+                rpc_client,
+                Some(Duration::from_secs(60)),
+                sample_block_template(),
+            )
+            .unwrap()
+            .with_template_wake(template_wake);
+            server.known_targets.write().insert(
+                tip_block().hash,
+                bitcoin::Target::from_be_bytes([0xff; 32]),
+            );
+            server
+        }
+
+        fn request(long_poll_id: Option<String>) -> BlockTemplateRequest {
+            BlockTemplateRequest {
+                mode: None,
+                data: None,
+                rules: vec!["segwit".to_owned()],
+                capabilities: HashSet::new(),
+                long_poll_id,
+            }
+        }
+
+        fn bid_tx() -> Transaction {
+            Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::all_zeros(), 0),
+                    sequence: Sequence::MAX,
+                    script_sig: ScriptBuf::new(),
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1000),
+                    script_pubkey: ScriptBuf::new_op_return([1u8; 4]),
+                }],
+            }
+        }
+
+        fn wake_gen_of(template: &BlockTemplate) -> Option<u64> {
+            template
+                .long_poll_id
+                .as_deref()
+                .and_then(parse_long_poll_wake_gen)
+        }
+
+        fn contains(template: &BlockTemplate, txid: Txid) -> bool {
+            template.transactions.iter().any(|tx| tx.txid == txid)
+        }
+
+        /// A long-poll parked on a cached template returns soon after a wake
+        /// whose tx is inserted under the same write lock, with the tx and
+        /// the new generation (not the cached template from before).
+        #[tokio::test]
+        async fn woken_long_poll_serves_the_new_tx() {
+            let template_wake = TemplateWake::new();
+            let server = std::sync::Arc::new(server(
+                WakeDuringQuery(None),
+                &template_wake,
+            ));
+            let first =
+                server.build_block_template(request(None)).await.unwrap();
+            assert_eq!(wake_gen_of(&first), Some(0));
+            let start = Instant::now();
+            let poll = tokio::spawn({
+                let server = server.clone();
+                async move {
+                    server
+                        .build_block_template(request(first.long_poll_id))
+                        .await
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let tx = bid_tx();
+            let txid = tx.compute_txid();
+            server
+                .mempool
+                .with_mut_for_test(|mempool| {
+                    template_wake.wake();
+                    let weight = tx.weight();
+                    mempool
+                        .insert(
+                            tx,
+                            Amount::from_sat(1000),
+                            Default::default(),
+                            weight,
+                        )
+                        .unwrap();
+                })
+                .await
+                .unwrap();
+            let woken = tokio::time::timeout(Duration::from_secs(3), poll)
+                .await
+                .expect("long-poll not woken")
+                .unwrap()
+                .unwrap();
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(contains(&woken, txid), "woken template lacks the tx");
+            assert_eq!(wake_gen_of(&woken), Some(1));
+        }
+
+        /// A wake landing after the mempool was queried must not be claimed
+        /// by the template being built (it lacks the tx the wake is for): the
+        /// template keeps the old generation, so the next long-poll returns
+        /// at once with a fresh one.
+        #[tokio::test]
+        async fn wake_after_query_is_not_claimed() {
+            let template_wake = TemplateWake::new();
+            let server = server(
+                WakeDuringQuery(Some((
+                    template_wake.clone(),
+                    AtomicBool::new(false),
+                ))),
+                &template_wake,
+            );
+            let first =
+                server.build_block_template(request(None)).await.unwrap();
+            assert_eq!(*template_wake.subscribe().borrow(), 1, "hook fired");
+            assert_eq!(wake_gen_of(&first), Some(0));
+            let start = Instant::now();
+            let next = server
+                .build_block_template(request(first.long_poll_id))
+                .await
+                .unwrap();
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert_eq!(wake_gen_of(&next), Some(1));
         }
     }
 }

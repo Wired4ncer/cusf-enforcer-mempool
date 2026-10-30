@@ -1852,6 +1852,48 @@ where
         }
     }
 
+    /// A `MempoolSync` over `mempool` with no sync task, for tests outside
+    /// this module.
+    #[cfg(test)]
+    pub(crate) fn for_test(enforcer: Enforcer, mempool: Mempool) -> Self {
+        let tip = mempool.chain.tip;
+        let (tip_watch, tip_rx) = watch::channel(tip);
+        let inner = Arc::new(TokioRwLock::new(MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer,
+            mempool,
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip,
+                txs: HashSet::new(),
+            },
+            reconsider_attempts: HashMap::new(),
+        }));
+        let inner_weak = Arc::downgrade(&inner);
+        // Stands in for the sync task, which owns the mempool.
+        let task = tokio::task::spawn(async move {
+            let _inner = inner;
+            std::future::pending::<()>().await
+        });
+        Self {
+            inner: inner_weak,
+            _task: tokio_util::task::AbortOnDropHandle::new(task),
+            tip_rx,
+        }
+    }
+
+    /// Run `f` under the write lock the sync task holds while it accepts and
+    /// inserts txs, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) async fn with_mut_for_test<Output>(
+        &self,
+        f: impl FnOnce(&mut Mempool) -> Output,
+    ) -> Option<Output> {
+        let inner = self.inner.upgrade()?;
+        let mut inner_write = inner.write().await;
+        Some(f(&mut inner_write.mempool))
+    }
+
     /// Apply a function over the mempool and enforcer.
     /// Returns `None` if the mempool is unavailable due to an error.
     pub async fn with<F, Output>(&self, f: F) -> Option<Output>

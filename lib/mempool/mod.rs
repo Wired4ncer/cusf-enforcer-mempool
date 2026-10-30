@@ -515,6 +515,16 @@ impl Mempool {
         }
     }
 
+    /// An empty mempool on top of `tip_block`, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn with_tip_for_test(
+        tip_block: bitcoin_jsonrpsee::client::Block<true>,
+    ) -> Self {
+        let mut res = Self::new(tip_block.hash);
+        res.chain.blocks.insert(tip_block.hash, tip_block);
+        res
+    }
+
     pub fn tip(&self) -> &bitcoin_jsonrpsee::client::Block<true> {
         &self.chain.blocks[&self.chain.tip]
     }
