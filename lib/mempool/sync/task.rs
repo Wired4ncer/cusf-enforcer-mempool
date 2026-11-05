@@ -3969,6 +3969,34 @@ mod tests {
         assert!(!h.sync_state.known_fees.contains_key(&child_txid));
     }
 
+    /// The fee's answer is already on its way when the `Removed` lands. Nothing
+    /// would ever forget a fee stored after that, so it is not stored.
+    #[tokio::test]
+    async fn fee_answer_after_removal_is_not_kept() {
+        let (_parent, child) = confirmed_parent_and_child();
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+
+        h.node_accepts(&child, 10_000).await.unwrap();
+        h.serve_one().await.unwrap(); // the tx's bytes
+        let request = h
+            .sync_state
+            .request_queue
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("the fee request");
+        let resp = batched_request(&h.client, request).await.unwrap();
+        h.node_drops(child_txid).await.unwrap();
+        handle_resp(&mut h.inner, &mut h.sync_state, resp)
+            .await
+            .unwrap();
+
+        assert!(!h.sync_state.known_fees.contains_key(&child_txid));
+        assert_eq!(h.fee_of(&child_txid), None);
+        assert!(h.is_synced());
+    }
+
     /// A burst costs one call per batch, not one per tx.
     #[tokio::test]
     async fn burst_of_new_txs_is_batched_with_right_fees() {
