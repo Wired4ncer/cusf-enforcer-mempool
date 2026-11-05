@@ -2,8 +2,8 @@
 //!
 //! When mempool txs are removed, they become unavailable, and so any
 //! transactions that require removed mempool txs in order to be validated are
-//! placed into an 'abandoned' pool, which is expected to be empty at the end
-//! of a successful mempool sync.
+//! placed into an 'abandoned' pool. It need not be empty when a sync ends: a child
+//! can wait there on a parent the node cannot serve, out of block templates.
 //! Transactions in the abandoned pool are not validated by the enforcer.
 //! If a removed mempool tx becomes available again, transactions that depend
 //! on it in the abandoned pool can be validated and added back into the

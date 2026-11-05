@@ -9,7 +9,7 @@ use core::future::Future;
 use std::{
     borrow::BorrowMut,
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     marker::PhantomData,
     path::Path,
     sync::Arc,
@@ -122,6 +122,9 @@ where
 }
 
 struct MempoolSyncInner<Enforcer> {
+    /// Txids of the most recently connected blocks, oldest first, whose
+    /// `known_fees` entries are still kept.
+    mined_fee_blocks: VecDeque<Vec<Txid>>,
     abandoned_pool: AbandonedPool,
     enforcer: Enforcer,
     mempool: Mempool,
@@ -154,8 +157,9 @@ pub struct SyncState {
     txs_needed: LinkedHashSet<Txid>,
     unavailable_txs: HashSet<Txid>,
     /// Fees Core computed: `getrawmempool verbose` at startup, then
-    /// `getmempoolentry` per arriving tx. Forgotten when the tx is mined or
-    /// leaves the mempool.
+    /// `getmempoolentry` per arriving tx. A txid fixes its fee, so an entry is
+    /// never stale. Forgotten when the tx leaves the mempool, or
+    /// [`MINED_FEE_KEEP_BLOCKS`] blocks after it was mined.
     known_fees: HashMap<Txid, Amount>,
     /// Txids Core reported in the mempool. Used to tell a parent that is
     /// itself in the mempool -- which carries dependency semantics and must
@@ -302,13 +306,31 @@ where
                 .iter()
                 .map(Transaction::compute_txid)
                 .collect();
+            // Keep the fees of mined txs for a few blocks. If a reorg returns
+            // one to the mempool, it must re-enter at once: waiting on a fee
+            // call would release the lock with its child still in the mempool
+            // and the long-poll awake, and a template holding the child without
+            // the parent is one the node rejects (review 2026-11-05).
+            inner
+                .mined_fee_blocks
+                .push_back(mined_txids.iter().copied().collect());
+            while inner.mined_fee_blocks.len() > MINED_FEE_KEEP_BLOCKS {
+                let Some(oldest) = inner.mined_fee_blocks.pop_front() else {
+                    break;
+                };
+                for txid in oldest {
+                    // Back in the mempool after a reorg: still needed.
+                    if !inner.unfiltered_mempool.txs.contains(&txid) {
+                        sync_state.known_fees.remove(&txid);
+                    }
+                }
+            }
             // Parked txs whose parent this block just made available.
             let mut restored = Vec::new();
             for tx in block_decoded.txdata {
                 let txid = tx.compute_txid();
                 let _removed: Option<_> = inner.mempool.remove(&txid)?;
                 sync_state.txs_needed.remove(&txid);
-                sync_state.known_fees.remove(&txid);
                 // Its fetch may have lost the race with this block after the
                 // block's response cleared this (`handle_resp_block`). Left
                 // set, every later child would be parked on a confirmed coin.
@@ -1589,6 +1611,11 @@ where
     _marker: PhantomData<Enforcer>,
 }
 
+/// How many connected blocks a mined tx's fee is kept for a reorg. Far deeper
+/// than any reorg seen on mainnet (one block, 2026-11); a deeper one only falls
+/// back to a fee call.
+const MINED_FEE_KEEP_BLOCKS: usize = 12;
+
 /// Seed the tx cache from Core's `mempool.dat`, best-effort.
 fn seed_tx_cache_from_dat(
     path: &Path,
@@ -1708,6 +1735,7 @@ where
     let inner = MempoolSyncInner {
         abandoned_pool: AbandonedPool::default(),
         reconsider_attempts: HashMap::new(),
+        mined_fee_blocks: VecDeque::new(),
         enforcer,
         mempool: Mempool::new(best_block_hash),
         tip_watch,
@@ -1797,6 +1825,7 @@ where
                 tip_watch,
                 unfiltered_mempool,
                 reconsider_attempts,
+                mined_fee_blocks,
             } = inner.into_inner();
             MempoolSyncing {
                 inner: MempoolSyncInner {
@@ -1806,6 +1835,7 @@ where
                     tip_watch,
                     unfiltered_mempool,
                     reconsider_attempts,
+                    mined_fee_blocks,
                 },
                 sync_state,
             }
@@ -1862,6 +1892,7 @@ where
                         tip_watch,
                         unfiltered_mempool,
                         reconsider_attempts,
+                        mined_fee_blocks,
                     },
                 sync_state,
             } = inner;
@@ -1873,6 +1904,7 @@ where
                 tip_watch,
                 unfiltered_mempool,
                 reconsider_attempts,
+                mined_fee_blocks,
             };
             (inner, tip_rx, sync_state)
         };
@@ -1913,6 +1945,7 @@ where
                 txs: HashSet::new(),
             },
             reconsider_attempts: HashMap::new(),
+            mined_fee_blocks: VecDeque::new(),
         }));
         let inner_weak = Arc::downgrade(&inner);
         // Stands in for the sync task, which owns the mempool.
@@ -2004,6 +2037,7 @@ mod tests {
         let mut inner = MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
             reconsider_attempts: HashMap::new(),
+            mined_fee_blocks: VecDeque::new(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -2172,6 +2206,7 @@ mod tests {
         let mut inner = MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
             reconsider_attempts: HashMap::new(),
+            mined_fee_blocks: VecDeque::new(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -2234,6 +2269,7 @@ mod tests {
         let mut inner = MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
             reconsider_attempts: HashMap::new(),
+            mined_fee_blocks: VecDeque::new(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -2312,6 +2348,7 @@ mod tests {
         let mut inner = MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
             reconsider_attempts: HashMap::new(),
+            mined_fee_blocks: VecDeque::new(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -2379,6 +2416,7 @@ mod tests {
         MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
             reconsider_attempts: HashMap::new(),
+            mined_fee_blocks: VecDeque::new(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -2986,6 +3024,7 @@ mod tests {
         MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
             reconsider_attempts: HashMap::new(),
+            mined_fee_blocks: VecDeque::new(),
             enforcer,
             mempool: Mempool::new(genesis),
             tip_watch,
@@ -4219,7 +4258,7 @@ mod tests {
 
     /// `known_fees` now grows with every arrival, so it must shrink as well.
     #[tokio::test]
-    async fn known_fees_forgets_mined_txs() {
+    async fn known_fees_keep_mined_txs_for_a_reorg_then_forget() {
         let (_parent, child) = confirmed_parent_and_child();
         let child_txid = child.compute_txid();
         let mut h = NodeHarness::start(false).await;
@@ -4229,7 +4268,32 @@ mod tests {
 
         h.connect(&[&child]).await.unwrap();
 
-        assert!(!h.sync_state.known_fees.contains_key(&child_txid));
+        // Out of the mempool, but a reorg must not need another fee call.
         assert_eq!(h.fee_of(&child_txid), None);
+        assert!(h.sync_state.known_fees.contains_key(&child_txid));
+
+        for _ in 0..MINED_FEE_KEEP_BLOCKS - 1 {
+            h.connect(&[]).await.unwrap();
+        }
+        assert!(h.sync_state.known_fees.contains_key(&child_txid));
+        h.connect(&[]).await.unwrap();
+        assert!(!h.sync_state.known_fees.contains_key(&child_txid));
+    }
+
+    #[tokio::test]
+    async fn known_fees_keep_a_tx_a_reorg_returned_to_the_mempool() {
+        let (_parent, child) = confirmed_parent_and_child();
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node_accepts(&child, 10_000).await.unwrap();
+        h.pump().await.unwrap();
+        h.connect(&[&child]).await.unwrap();
+
+        // As after a reorg: back in the mirror of the node's mempool.
+        h.inner.unfiltered_mempool.txs.insert(child_txid);
+        for _ in 0..MINED_FEE_KEEP_BLOCKS {
+            h.connect(&[]).await.unwrap();
+        }
+        assert!(h.sync_state.known_fees.contains_key(&child_txid));
     }
 }
