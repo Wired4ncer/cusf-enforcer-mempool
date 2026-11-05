@@ -2118,8 +2118,10 @@ mod tests {
             let mut rejected_txs = HashSet::new();
             let mut txs_needed = LinkedHashSet::new();
             let mut unavailable_txs = HashSet::new();
-            let mut known_fees: HashMap<Txid, Amount> =
-                tx_cache.keys().map(|txid| (*txid, Amount::ONE_SAT)).collect();
+            let mut known_fees: HashMap<Txid, Amount> = tx_cache
+                .keys()
+                .map(|txid| (*txid, Amount::ONE_SAT))
+                .collect();
             let sync_state = SyncStateBorrowedMut {
                 blocks_needed: &mut blocks_needed,
                 rejected_blocks: &mut rejected_blocks,
@@ -2557,11 +2559,7 @@ mod tests {
 
         // Confirmed parent: nothing to fetch it for.
         assert!(
-            !needs_parent_fetch(
-                &sync_state,
-                &HashSet::new(),
-                &parent_txid
-            ),
+            !needs_parent_fetch(&sync_state, &HashSet::new(), &parent_txid),
             "a confirmed parent is not fetched"
         );
 
@@ -2582,11 +2580,7 @@ mod tests {
             &parent_txid
         ));
         sync_state.tx_cache.insert(parent_txid, parent);
-        assert!(!needs_parent_fetch(
-            &sync_state,
-            &live,
-            &parent_txid
-        ));
+        assert!(!needs_parent_fetch(&sync_state, &live, &parent_txid));
     }
 
     /// Build an RPC `Block<true>` (verbose `getblock`) from real txs, for the
@@ -3790,9 +3784,7 @@ mod tests {
         }
 
         /// Serve queued requests until none is left.
-        async fn pump(
-            &mut self,
-        ) -> Result<(), SyncTaskError<DefaultEnforcer>> {
+        async fn pump(&mut self) -> Result<(), SyncTaskError<DefaultEnforcer>> {
             while self.serve_one().await? {}
             Ok(())
         }
@@ -3846,7 +3838,10 @@ mod tests {
         let (parent, child) = confirmed_parent_and_child();
         let child_txid = child.compute_txid();
         let mut h = NodeHarness::start(true).await;
-        h.node.lock().confirmed.insert(parent.compute_txid(), parent);
+        h.node
+            .lock()
+            .confirmed
+            .insert(parent.compute_txid(), parent);
 
         h.node_accepts(&child, 10_000).await.unwrap();
         h.pump().await.unwrap();
@@ -3870,7 +3865,10 @@ mod tests {
 
         let mut from_snapshot = NodeHarness::start(false).await;
         from_snapshot.sync_state.known_fees.insert(child_txid, fee);
-        from_snapshot.node_accepts(&child, fee.to_sat()).await.unwrap();
+        from_snapshot
+            .node_accepts(&child, fee.to_sat())
+            .await
+            .unwrap();
         from_snapshot.pump().await.unwrap();
         assert!(
             from_snapshot.node.lock().entry_asked.is_empty(),
@@ -3891,7 +3889,10 @@ mod tests {
         let (parent, child) = confirmed_parent_and_child();
         let child_txid = child.compute_txid();
         let mut h = NodeHarness::start(false).await;
-        h.node.lock().confirmed.insert(parent.compute_txid(), parent);
+        h.node
+            .lock()
+            .confirmed
+            .insert(parent.compute_txid(), parent);
 
         h.node_accepts(&child, 10_000).await.unwrap();
         h.serve_one().await.unwrap(); // the tx's bytes
@@ -3915,7 +3916,10 @@ mod tests {
         let (parent, child) = confirmed_parent_and_child();
         let child_txid = child.compute_txid();
         let mut h = NodeHarness::start(false).await;
-        h.node.lock().confirmed.insert(parent.compute_txid(), parent);
+        h.node
+            .lock()
+            .confirmed
+            .insert(parent.compute_txid(), parent);
         h.node.lock().entry_error = Some(-28); // RPC_IN_WARMUP
 
         h.node_accepts(&child, 10_000).await.unwrap();
@@ -3950,7 +3954,10 @@ mod tests {
         let (parent, child) = confirmed_parent_and_child();
         let child_txid = child.compute_txid();
         let mut h = NodeHarness::start(false).await;
-        h.node.lock().confirmed.insert(parent.compute_txid(), parent);
+        h.node
+            .lock()
+            .confirmed
+            .insert(parent.compute_txid(), parent);
 
         h.node_accepts(&child, 10_000).await.unwrap();
         h.serve_one().await.unwrap(); // the tx's bytes
@@ -3975,7 +3982,8 @@ mod tests {
         let mut txs = Vec::new();
         for i in 0..BURST {
             let fee = 1_000 + i;
-            let tx = make_tx(&[OutPoint::new(parent_txid, 0)], &[100_000 - fee]);
+            let tx =
+                make_tx(&[OutPoint::new(parent_txid, 0)], &[100_000 - fee]);
             h.node_accepts(&tx, fee).await.unwrap();
             txs.push((tx.compute_txid(), fee));
         }
@@ -4027,7 +4035,8 @@ mod tests {
         let mut h = NodeHarness::start(false).await;
         {
             let mut node = h.node.lock();
-            node.confirmed.insert(grandparent.compute_txid(), grandparent);
+            node.confirmed
+                .insert(grandparent.compute_txid(), grandparent);
             node.mempool
                 .insert(parent_txid, (parent, Amount::from_sat(10_000)));
             node.mempool

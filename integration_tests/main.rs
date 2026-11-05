@@ -11,9 +11,8 @@ use cusf_enforcer_mempool_integration_tests::{
     test_gbt_long_poll, test_invalid_block_during_initial_sync,
     test_mempool_dat_fast_path, test_mined_rejected_parent,
     test_orphan_admitted_after_disconnect_removal,
-    test_orphan_admitted_after_enforcer_removal,
-    test_pruned_no_txindex_sync, test_rbf_removed_for_absent_tx,
-    test_rejected_block_disconnect,
+    test_orphan_admitted_after_enforcer_removal, test_pruned_no_txindex_sync,
+    test_rbf_removed_for_absent_tx, test_rejected_block_disconnect,
     test_reorg_re_inserts_tx, test_reorg_reinserts_parent_under_child,
     test_tx_replaced_during_fetch,
     util::{

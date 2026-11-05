@@ -12,27 +12,39 @@ use std::{
     time::Duration,
 };
 
-use bitcoin::{Amount, Txid};
+use bitcoin::{Amount, OutPoint, Txid};
 use bitcoin_jsonrpsee::{
     MainClient as _,
-    client::{RawMempoolTxInfo, GetRawTransactionClient as _, GetRawTransactionVerbose},
+    client::{
+        GetRawTransactionClient as _, GetRawTransactionVerbose,
+        RawMempoolTxInfo,
+    },
     jsonrpsee::{core::client::ClientT as _, rpc_params},
 };
 use tokio::time::{sleep, timeout};
 
 use crate::{
     mock_enforcer::MockEnforcer,
-    setup::{Directories, RegtestNode, start_mempool_sync, wait_for_local_mempool},
-    util::{BinPaths, RpcClient, get_new_address, send_to_address},
+    setup::{
+        Directories, RegtestNode, start_mempool_sync, wait_for_local_mempool,
+    },
+    util::{
+        BinPaths, RpcClient, get_new_address, send_to_address, spend_output,
+    },
 };
 
 /// Long enough for several sends to land after the fee snapshot. Far longer
 /// than this sync takes with txindex (well under a second).
 const SYNC_TIMEOUT: Duration = Duration::from_secs(45);
+const SEEDED_TXS: usize = 300;
+const RESERVED_COINS: usize = 60;
+const SEND_INTERVAL: Duration = Duration::from_millis(5);
+const FEE_SAT: u64 = 5_000;
 
 async fn base_fee(rpc: &RpcClient, txid: Txid) -> anyhow::Result<Amount> {
-    let info: RawMempoolTxInfo =
-        rpc.request("getmempoolentry", rpc_params![txid.to_string()]).await?;
+    let info: RawMempoolTxInfo = rpc
+        .request("getmempoolentry", rpc_params![txid.to_string()])
+        .await?;
     Ok(info.fees.base)
 }
 
@@ -45,8 +57,11 @@ pub async fn test_pruned_no_txindex_sync(
     let rpc = node.rpc_client.clone();
     // More mature coinbases, so sends spend confirmed coins.
     for _ in 0..10 {
-        rpc.generate_to_address(10, &node.mining_address.clone().into_unchecked())
-            .await?;
+        rpc.generate_to_address(
+            10,
+            &node.mining_address.clone().into_unchecked(),
+        )
+        .await?;
     }
 
     // The premise: this node cannot return a confirmed tx.
@@ -64,22 +79,56 @@ pub async fn test_pruned_no_txindex_sync(
         "unexpected error: {err}"
     );
 
+    // Confirmed coins kept back from the wallet's own coin selection: each tx
+    // below spends one, so its parent is only in a block.
+    let unspent: Vec<serde_json::Value> =
+        rpc.request("listunspent", rpc_params![100]).await?;
+    let mut reserved = Vec::new();
+    for utxo in unspent.iter().take(RESERVED_COINS) {
+        let txid: Txid = utxo["txid"].as_str().unwrap_or_default().parse()?;
+        let vout = utxo["vout"].as_u64().unwrap_or_default() as u32;
+        let sat = (utxo["amount"].as_f64().unwrap_or_default() * 1e8) as u64;
+        reserved.push((OutPoint::new(txid, vout), sat));
+    }
+    anyhow::ensure!(reserved.len() == RESERVED_COINS, "too few coins");
+    let locks: Vec<serde_json::Value> = reserved
+        .iter()
+        .map(|(outpoint, _)| {
+            serde_json::json!({
+                "txid": outpoint.txid.to_string(),
+                "vout": outpoint.vout,
+            })
+        })
+        .collect();
+    let locked: bool = rpc
+        .request("lockunspent", rpc_params![false, locks])
+        .await?;
+    anyhow::ensure!(locked, "lockunspent");
+    let (late_outpoint, late_sat) =
+        reserved.pop().expect("RESERVED_COINS is not zero");
+
+    // A mempool to chew on, so the sync lasts long enough to be overtaken.
     let address = get_new_address(&rpc).await?;
+    for _ in 0..SEEDED_TXS {
+        send_to_address(&rpc, &address, 100_000).await?;
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     let sender = {
-        let (rpc, address, stop) = (rpc.clone(), address.clone(), stop.clone());
+        let (rpc, stop) = (rpc.clone(), stop.clone());
         tokio::spawn(async move {
             let mut sent = 0u32;
-            while !stop.load(Ordering::Relaxed) {
-                send_to_address(&rpc, &address, 100_000)
-                    .await?;
+            for (outpoint, sat) in reserved {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                spend_output(&rpc, outpoint, sat, FEE_SAT).await?;
                 sent += 1;
-                sleep(Duration::from_millis(20)).await;
+                sleep(SEND_INTERVAL).await;
             }
             anyhow::Ok(sent)
         })
     };
-    sleep(Duration::from_millis(200)).await;
 
     let synced = timeout(
         SYNC_TIMEOUT,
@@ -109,7 +158,7 @@ pub async fn test_pruned_no_txindex_sync(
 
     // A tx after sync, spending a confirmed coin: this one's fee is the
     // entry's, with no snapshot in play.
-    let late = send_to_address(&rpc, &address, 100_000).await?;
+    let late = spend_output(&rpc, late_outpoint, late_sat, FEE_SAT).await?;
     wait_for_local_mempool(
         &mempool_sync,
         &task_errors,
