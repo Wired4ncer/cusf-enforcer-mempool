@@ -15,6 +15,7 @@ pub mod test_mempool_dat_fast_path;
 pub mod test_mined_rejected_parent;
 pub mod test_orphan_admitted_after_disconnect_removal;
 pub mod test_orphan_admitted_after_enforcer_removal;
+pub mod test_pruned_no_txindex_sync;
 pub mod test_rbf_removed_for_absent_tx;
 pub mod test_rejected_block_disconnect;
 pub mod test_reorg_re_inserts_tx;

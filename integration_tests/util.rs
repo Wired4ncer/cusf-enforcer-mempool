@@ -88,17 +88,24 @@ pub struct Bitcoind {
     pub rpc_user: String,
     pub rpc_pass: String,
     pub zmq_sequence_port: u16,
+    /// `-prune=550` and no `-txindex`, as on a pruned production node.
+    pub pruned_no_txindex: bool,
 }
 
 impl Bitcoind {
     pub fn spawn(&self) -> anyhow::Result<AbortOnDrop<()>> {
+        let index_arg = if self.pruned_no_txindex {
+            "-prune=550"
+        } else {
+            "-txindex"
+        };
         let args: Vec<OsString> = [
             "-regtest".to_owned(),
             "-server".to_owned(),
             "-listenonion=0".to_owned(),
             "-fallbackfee=0.00001".to_owned(),
             "-acceptnonstdtxn=1".to_owned(),
-            "-txindex".to_owned(),
+            index_arg.to_owned(),
             // Skip wallet sqlite fsyncs: per-block wallet syncs otherwise
             // dominate the suite's runtime (~55s -> ~3s wall). Only unsafe
             // on OS crash/power loss, which never matters for throwaway

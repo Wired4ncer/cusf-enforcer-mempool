@@ -12,7 +12,8 @@ use cusf_enforcer_mempool_integration_tests::{
     test_mempool_dat_fast_path, test_mined_rejected_parent,
     test_orphan_admitted_after_disconnect_removal,
     test_orphan_admitted_after_enforcer_removal,
-    test_rbf_removed_for_absent_tx, test_rejected_block_disconnect,
+    test_pruned_no_txindex_sync, test_rbf_removed_for_absent_tx,
+    test_rejected_block_disconnect,
     test_reorg_re_inserts_tx, test_reorg_reinserts_parent_under_child,
     test_tx_replaced_during_fetch,
     util::{
@@ -310,6 +311,11 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
         }),
         ("mempool_dat_fast_path", |bp, dirs| {
             Box::pin(test_mempool_dat_fast_path::test_mempool_dat_fast_path(
+                bp, dirs,
+            ))
+        }),
+        ("pruned_no_txindex_sync", |bp, dirs| {
+            Box::pin(test_pruned_no_txindex_sync::test_pruned_no_txindex_sync(
                 bp, dirs,
             ))
         }),

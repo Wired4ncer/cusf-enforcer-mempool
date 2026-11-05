@@ -130,6 +130,22 @@ impl RegtestNode {
         bin_paths: &BinPaths,
         directories: Directories,
     ) -> anyhow::Result<Self> {
+        Self::new_with(bin_paths, directories, false).await
+    }
+
+    /// As [`Self::new`], on a node with `-prune` and no `-txindex`.
+    pub async fn new_pruned_no_txindex(
+        bin_paths: &BinPaths,
+        directories: Directories,
+    ) -> anyhow::Result<Self> {
+        Self::new_with(bin_paths, directories, true).await
+    }
+
+    async fn new_with(
+        bin_paths: &BinPaths,
+        directories: Directories,
+        pruned_no_txindex: bool,
+    ) -> anyhow::Result<Self> {
         let reserved_ports = ReservedPorts::new()?;
         let bitcoind = Bitcoind {
             path: bin_paths.bitcoind()?.to_path_buf(),
@@ -139,6 +155,7 @@ impl RegtestNode {
             rpc_user: "regtest".to_owned(),
             rpc_pass: "regtest".to_owned(),
             zmq_sequence_port: reserved_ports.bitcoind_zmq_sequence.port(),
+            pruned_no_txindex,
         };
         tracing::info!(
             rpc_port = bitcoind.rpc_port,
