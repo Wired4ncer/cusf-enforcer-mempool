@@ -35,8 +35,13 @@ pub struct AbandonedPool {
 }
 
 impl AbandonedPool {
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.abandoned_txs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.abandoned_txs.len()
     }
 
     /// Returns `true` if the tx is present in the pool.

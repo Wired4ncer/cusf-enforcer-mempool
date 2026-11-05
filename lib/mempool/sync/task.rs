@@ -153,7 +153,9 @@ pub struct SyncState {
     tx_cache: HashMap<Txid, Transaction>,
     txs_needed: LinkedHashSet<Txid>,
     unavailable_txs: HashSet<Txid>,
-    /// Fees Core already computed, from `getrawmempool verbose`
+    /// Fees Core computed: `getrawmempool verbose` at startup, then
+    /// `getmempoolentry` per arriving tx. Forgotten when the tx is mined or
+    /// leaves the mempool.
     known_fees: HashMap<Txid, Amount>,
     /// Txids Core reported in the mempool. Used to tell a parent that is
     /// itself in the mempool -- which carries dependency semantics and must
@@ -173,7 +175,7 @@ struct SyncStateBorrowedMut<'a> {
     tx_cache: &'a mut HashMap<Txid, Transaction>,
     txs_needed: &'a mut LinkedHashSet<Txid>,
     unavailable_txs: &'a mut HashSet<Txid>,
-    known_fees: &'a HashMap<Txid, Amount>,
+    known_fees: &'a mut HashMap<Txid, Amount>,
     /// Pruned as members confirm or are removed, so a stale entry cannot
     /// classify a since-confirmed tx as still-unconfirmed (issue #611).
     mempool_txids: &'a mut HashSet<Txid>,
@@ -190,9 +192,12 @@ struct MempoolSyncingBorrowed<'a, Enforcer> {
 }
 
 impl<Enforcer> MempoolSyncingBorrowed<'_, Enforcer> {
+    /// A tx in the abandoned pool does not hold this up. Nothing is in flight
+    /// for it: it waits on a message from the node (its parent back, or its
+    /// own removal) that may never come, and it stays out of the mempool, and
+    /// so out of templates, meanwhile. The same pool carries on after sync.
     fn is_synced(&self) -> bool {
-        self.inner.abandoned_pool.is_empty()
-            && self.sync_state.blocks_needed.is_empty()
+        self.sync_state.blocks_needed.is_empty()
             && self.sync_state.txs_needed.is_empty()
             && self.sync_state.action_queue.is_empty()
             && self.inner.mempool.chain.tip == self.inner.unfiltered_mempool.tip
@@ -200,8 +205,9 @@ impl<Enforcer> MempoolSyncingBorrowed<'_, Enforcer> {
 }
 
 // TODO: move txs_needed / request_queue handling out
-/// Returns the rejected txs to reconsider now that the tip moved, parents
-/// before children (see [`reconsider_rejected_txs`]). The caller queues an
+/// Returns the txs to drive again now that the tip moved, parents before
+/// children: those parked on a tx this block mined, then the rejected ones to
+/// reconsider (see [`reconsider_rejected_txs`]). The caller queues an
 /// `InsertTx` for each, in that order, at the front of the action queue.
 async fn connect_block<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
@@ -296,10 +302,28 @@ where
                 .iter()
                 .map(Transaction::compute_txid)
                 .collect();
+            // Parked txs whose parent this block just made available.
+            let mut restored = Vec::new();
             for tx in block_decoded.txdata {
                 let txid = tx.compute_txid();
                 let _removed: Option<_> = inner.mempool.remove(&txid)?;
                 sync_state.txs_needed.remove(&txid);
+                sync_state.known_fees.remove(&txid);
+                // Its fetch may have lost the race with this block after the
+                // block's response cleared this (`handle_resp_block`). Left
+                // set, every later child would be parked on a confirmed coin.
+                sync_state.unavailable_txs.remove(&txid);
+                // Mined while parked: no removal message will ever come for it.
+                inner.abandoned_pool.remove(&txid);
+                for (restored_txid, restored_tx) in
+                    inner.abandoned_pool.restore_descendant_txs(&txid)
+                {
+                    sync_state.tx_cache.insert(restored_txid, restored_tx);
+                    if !mined_txids.contains(&restored_txid) {
+                        inner.unfiltered_mempool.txs.remove(&restored_txid);
+                        restored.push(restored_txid);
+                    }
+                }
                 // A tx this block mined is valid by the rules that accepted
                 // the block, whatever `accept_tx` said about it earlier (an
                 // M8 that reached us before the block it names is rejected as
@@ -319,6 +343,7 @@ where
                 sync_state
                     .request_queue
                     .remove(&RequestItem::Tx(txid, true));
+                sync_state.request_queue.remove(&RequestItem::Fee(txid));
                 // Evict mempool txs that conflict with this confirmed tx:
                 // they spend an outpoint it just consumed. The node evicts
                 // them at block connect WITHOUT emitting a removal sequence
@@ -393,7 +418,9 @@ where
                 count = reconsider.len(),
                 "reconsidering rejected txs after block connect"
             );
-            Ok(reconsider)
+            restored.retain(|txid| !reconsider.contains(txid));
+            restored.extend(reconsider);
+            Ok(restored)
         }
         ConnectBlockAction::Reject => {
             sync_state.rejected_blocks.insert(block.hash);
@@ -610,7 +637,27 @@ where
     match event {
         TxHashEvent::Added => {
             if sync_state.tx_cache.contains_key(&txid) {
-                // Nothing to do
+                // The bytes are here, the fee may not be (a reorg hands back
+                // every tx of the block at once: queued here, they batch). The
+                // node has it again, so `unavailable` is out of date, and
+                // left set it would end this very insert as "left the mempool".
+                if sync_state.unavailable_txs.remove(&txid) {
+                    for (restored_txid, restored_tx) in inner
+                        .abandoned_pool
+                        .restore_descendant_txs(&txid)
+                        .into_iter()
+                        .rev()
+                    {
+                        inner.unfiltered_mempool.txs.remove(&restored_txid);
+                        sync_state.tx_cache.insert(restored_txid, restored_tx);
+                        sync_state
+                            .action_queue
+                            .push_front(SyncAction::InsertTx(restored_txid));
+                    }
+                }
+                if !sync_state.known_fees.contains_key(&txid) {
+                    sync_state.request_queue.push_back(RequestItem::Fee(txid));
+                }
                 return Ok(());
             }
             sync_state.txs_needed.replace(txid);
@@ -652,6 +699,7 @@ where
             sync_state
                 .request_queue
                 .remove(&RequestItem::Tx(txid, true));
+            sync_state.request_queue.remove(&RequestItem::Fee(txid));
         }
     }
     Ok(())
@@ -744,7 +792,7 @@ where
                     tx_cache: &mut sync_state.tx_cache,
                     txs_needed: &mut sync_state.txs_needed,
                     unavailable_txs: &mut sync_state.unavailable_txs,
-                    known_fees: &sync_state.known_fees,
+                    known_fees: &mut sync_state.known_fees,
                     mempool_txids: &mut sync_state.mempool_txids,
                 };
                 connect_block(inner, sync_state, &resp_block).await?
@@ -787,13 +835,12 @@ where
     Ok(())
 }
 
-/// Whether an arriving mempool tx's parent still has to be fetched.
+/// Whether an arriving mempool tx's parent has to be fetched.
 ///
-/// A parent is wanted for two things: the value of the output being
-/// spent, and -- when the parent is itself in the mempool -- the dependency
-/// state that decides whether this tx must be rejected or abandoned with it.
-/// Once Core has given us the fee, the first reason is gone, so a confirmed
-/// parent has nothing left to offer and is not requested.
+/// A parent is wanted for one thing: when it is itself in the mempool, the
+/// dependency state that decides whether this tx must be rejected or abandoned
+/// with it. The fee comes from the node, so a confirmed parent has nothing to
+/// offer, and without `txindex` the node could not return one anyway.
 ///
 /// `unfiltered_txs` is the live mirror of the node's mempool. The
 /// `mempool_txids` snapshot is frozen at initial sync, so on its own it
@@ -804,14 +851,12 @@ where
 fn needs_parent_fetch(
     sync_state: &SyncState,
     unfiltered_txs: &HashSet<Txid>,
-    fee_known: bool,
     input_txid: &Txid,
 ) -> bool {
     if sync_state.tx_cache.contains_key(input_txid) {
         return false;
     }
-    !fee_known
-        || sync_state.mempool_txids.contains(input_txid)
+    sync_state.mempool_txids.contains(input_txid)
         || unfiltered_txs.contains(input_txid)
 }
 
@@ -824,8 +869,9 @@ fn handle_resp_tx(sync_state: &mut SyncState, tx: Transaction) {
 /// First rejected parent, if any were rejected; otherwise
 /// Required parent txs, if any must be requested; otherwise
 /// Unavailable parent txs, if any are not available; otherwise
-/// Abandoned parent txs, if any are abandoned; otherwise all parent txs
-enum ParentTxsResult<'a> {
+/// Abandoned parent txs, if any are abandoned; otherwise nothing stands in the
+/// way
+enum ParentTxsResult {
     /// First rejected parent tx, by vin
     Rejected(Txid),
     /// Required parent txs, sorted by vin
@@ -834,13 +880,9 @@ enum ParentTxsResult<'a> {
     Unavailable(LinkedHashSet<Txid>),
     /// Abandoned parent txs, sorted by vin
     Abandoned(LinkedHashSet<Txid>),
-    /// The parent txs that were still worth resolving.
-    ///
-    /// NOT necessarily one entry per input. When the node has already given us
-    /// the tx's fee, confirmed parents are never fetched so they are absent here.
-    /// Parents that are themselves in the mempool are always present, because
-    /// they carry dependency state.
-    Available(HashMap<Txid, &'a Transaction>),
+    /// Every parent in the mempool is in the enforced mempool. A confirmed
+    /// parent is neither fetched nor looked at.
+    Available,
 }
 
 /// Everything consulted when resolving a tx's parents
@@ -859,14 +901,10 @@ struct ParentCaches<'a> {
     unfiltered_txs: &'a HashSet<Txid>,
 }
 
-/// `fee_known`: when the node has already supplied this tx's fee, a confirmed
-/// parent has nothing left to offer and is not requested. Parents in the
-/// mempool are unaffected.
-fn try_get_parent_txs_from_caches<'a>(
-    caches: ParentCaches<'a>,
+fn try_get_parent_txs_from_caches(
+    caches: ParentCaches<'_>,
     vin: &[TxIn],
-    fee_known: bool,
-) -> ParentTxsResult<'a> {
+) -> ParentTxsResult {
     let ParentCaches {
         abandoned_pool,
         mempool,
@@ -890,7 +928,6 @@ fn try_get_parent_txs_from_caches<'a>(
     let mut abandoned_input_txs = LinkedHashSet::new();
     let mut input_txs_needed = LinkedHashSet::new();
     let mut unavailable_input_txs = LinkedHashSet::new();
-    let mut input_txs = HashMap::<Txid, &Transaction>::new();
     for input in vin {
         let OutPoint {
             txid: input_txid,
@@ -898,30 +935,26 @@ fn try_get_parent_txs_from_caches<'a>(
         } = input.previous_output;
         if rejected_txs.contains(&input_txid) {
             return ParentTxsResult::Rejected(input_txid);
-        } else if let Some(input_tx) = tx_cache.get(&input_txid).filter(|_| {
-            // The tx cache holds fetched parent txs so we can read the value of
-            // the output being spent — all a *confirmed* parent is needed for.
-            // An unconfirmed *mempool* parent, though, must be present in the
-            // enforced mempool before its child is admitted: a cache hit must
-            // not stand in for that presence, or the child is inserted as a
-            // rootless orphan and the block template it lands in is
+        } else if tx_cache.contains_key(&input_txid)
+            && (!is_node_mempool_tx(&input_txid)
+                || mempool.txs.0.contains_key(&input_txid))
+        {
+            // A cache hit says nothing about an unconfirmed *mempool* parent,
+            // which must be present in the enforced mempool before its child is
+            // admitted: standing in for that presence would insert the child as
+            // a rootless orphan and the block template it lands in is
             // closure-broken (`bad-txns-inputs-missingorspent`). When such a
             // parent is only cached, fall through so the child is deferred
             // (`Required`) until the parent is actually inserted. (issue #611)
-            !is_node_mempool_tx(&input_txid)
-                || mempool.txs.0.contains_key(&input_txid)
-        }) {
-            input_txs.insert(input_txid, input_tx);
-        } else if let Some((input_tx, _)) = mempool.txs.0.get(&input_txid) {
-            input_txs.insert(input_txid, input_tx);
+        } else if mempool.txs.0.contains_key(&input_txid) {
         } else if abandoned_pool.contains(&input_txid) {
             abandoned_input_txs.replace(input_txid);
         } else if unavailable_txs.contains(&input_txid) {
             unavailable_input_txs.replace(input_txid);
-        } else if fee_known && !is_node_mempool_tx(&input_txid) {
-            // Confirmed parent, and Core already gave us this tx's fee. It was
-            // only ever fetched to read the value of the output being spent,
-            // so there is nothing left to learn from it.
+        } else if !is_node_mempool_tx(&input_txid) {
+            // Confirmed parent. The action queue is strictly FIFO, so the
+            // mirror is the node's mempool as of this tx's announcement: an
+            // unconfirmed parent would be in it by now.
         } else {
             input_txs_needed.replace(input_txid);
         }
@@ -933,39 +966,8 @@ fn try_get_parent_txs_from_caches<'a>(
     } else if !abandoned_input_txs.is_empty() {
         ParentTxsResult::Abandoned(abandoned_input_txs)
     } else {
-        ParentTxsResult::Available(input_txs)
+        ParentTxsResult::Available
     }
-}
-
-fn fee_delta<Enforcer>(
-    tx: &Transaction,
-    input_txs: &HashMap<Txid, &Transaction>,
-) -> Result<bitcoin::Amount, SyncTaskError<Enforcer>>
-where
-    Enforcer: CusfEnforcer,
-{
-    let mut value_in = Amount::ZERO;
-    for input in &tx.input {
-        let OutPoint {
-            txid: input_txid,
-            vout,
-        } = &input.previous_output;
-        let value = input_txs[input_txid].output[*vout as usize].value;
-        value_in = value_in
-            .checked_add(value)
-            .ok_or(SyncTaskError::ValueInOverflow)?;
-    }
-
-    let mut value_out = Amount::ZERO;
-    for output in &tx.output {
-        value_out = value_out
-            .checked_add(output.value)
-            .ok_or(SyncTaskError::ValueOutOverflow)?;
-    }
-    let fee_delta = value_in
-        .checked_sub(value_out)
-        .ok_or(SyncTaskError::FeeOverflow)?;
-    Ok(fee_delta)
 }
 
 // Returns `Success` if the tx was added to the mempool or abandoned pool,
@@ -973,7 +975,7 @@ where
 // was rejected. `Success` may carry front-of-queue inserts: parents that are
 // already fetched but whose own insert is still queued *behind* this tx, which
 // must be applied first (followed by this tx again).
-// Returns `Pending` if the tx or its parent txs must be fetched first.
+// Returns `Pending` if the tx, its parent txs or its fee must be fetched first.
 fn try_add_tx_from_caches<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: SyncStateBorrowedMut<'_>,
@@ -1007,8 +1009,7 @@ where
         mempool_txids: &*sync_state.mempool_txids,
         unfiltered_txs: &inner.unfiltered_mempool.txs,
     };
-    match try_get_parent_txs_from_caches(caches, &tx.input, known_fee.is_some())
-    {
+    match try_get_parent_txs_from_caches(caches, &tx.input) {
         ParentTxsResult::Rejected(rejected_parent) => {
             // Reject tx
             tracing::trace!(
@@ -1086,10 +1087,18 @@ where
             inner.unfiltered_mempool.txs.insert(txid);
             Ok(ApplySyncActionResult::from(true))
         }
-        ParentTxsResult::Available(parent_txs) => {
-            let fee_delta = match known_fee {
-                Some(fee) => fee,
-                None => fee_delta(tx, &parent_txs)?,
+        ParentTxsResult::Available => {
+            let Some(fee_delta) = known_fee else {
+                if sync_state.unavailable_txs.contains(&txid) {
+                    // Left the node's mempool before we learned its fee. It
+                    // is never admitted without one. Recorded like any other
+                    // unavailable tx, for its `Removed` or its block to clear.
+                    tracing::trace!(%txid, "tx left the mempool, not admitted");
+                    inner.unfiltered_mempool.txs.insert(txid);
+                    return Ok(ApplySyncActionResult::from(true));
+                }
+                sync_state.request_queue.push_front(RequestItem::Fee(txid));
+                return Ok(ApplySyncActionResult::Pending);
             };
             match inner
                 .enforcer
@@ -1250,6 +1259,7 @@ where
                 inner.abandoned_pool.remove(txid);
                 inner.reconsider_attempts.remove(txid);
                 sync_state.mempool_txids.remove(txid);
+                sync_state.known_fees.remove(txid);
                 Ok(ApplySyncActionResult::from(true))
             } else {
                 Err(SyncTaskError::UnfilteredMempoolMissingTx(*txid))
@@ -1299,7 +1309,7 @@ where
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
-                known_fees: &sync_state.known_fees,
+                known_fees: &mut sync_state.known_fees,
                 mempool_txids: &mut sync_state.mempool_txids,
             };
             try_add_tx_from_caches(inner, sync_state, txid)?
@@ -1313,7 +1323,7 @@ where
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
-                known_fees: &sync_state.known_fees,
+                known_fees: &mut sync_state.known_fees,
                 mempool_txids: &mut sync_state.mempool_txids,
             };
             try_apply_seq_message(inner, sync_state, &seq_msg).await?
@@ -1359,15 +1369,22 @@ where
             let mut input_txs_needed = LinkedHashSet::new();
             for (tx, in_mempool) in fetched {
                 if in_mempool {
-                    let fee_known =
-                        sync_state.known_fees.contains_key(&tx.compute_txid());
+                    // Asked for here, not when each tx reaches the head of the
+                    // queue, so a burst costs one call per batch.
+                    let txid = tx.compute_txid();
+                    if !sync_state.known_fees.contains_key(&txid)
+                        && !sync_state.unavailable_txs.contains(&txid)
+                    {
+                        sync_state
+                            .request_queue
+                            .push_front(RequestItem::Fee(txid));
+                    }
                     for input_txid in
                         tx.input.iter().map(|input| input.previous_output.txid)
                     {
                         if !needs_parent_fetch(
                             sync_state,
                             &inner.unfiltered_mempool.txs,
-                            fee_known,
                             &input_txid,
                         ) {
                             continue;
@@ -1384,6 +1401,26 @@ where
                 sync_state
                     .request_queue
                     .push_front(RequestItem::Tx(input_txid, false))
+            }
+        }
+        BatchedResponseItem::BatchFee { fees, gone } => {
+            for (txid, fee) in fees {
+                // A `Removed` overtook the answer: keep it out, nothing would
+                // ever forget it.
+                if !sync_state.unavailable_txs.contains(&txid) {
+                    sync_state.known_fees.insert(txid, fee);
+                }
+            }
+            for txid in gone {
+                tracing::debug!(
+                    %txid,
+                    "dropping fee fetch for a tx that left the mempool"
+                );
+                sync_state.txs_needed.remove(&txid);
+                sync_state
+                    .request_queue
+                    .remove(&RequestItem::Tx(txid, true));
+                sync_state.unavailable_txs.insert(txid);
             }
         }
         BatchedResponseItem::Single(ResponseItem::Block(block)) => {
@@ -1635,8 +1672,8 @@ where
     //
     // Best-effort: Core refuses `verbose` together with `mempool_sequence`, so
     // this is a second call and its snapshot can differ from the one above. A
-    // tx missing from it falls back to deriving the fee from parents,
-    // which is what every tx did before this optimization.
+    // tx missing from it gets its fee from `getmempoolentry`, like every tx
+    // that arrives later.
     let known_fees: HashMap<Txid, Amount> = {
         let started = std::time::Instant::now();
         match rpc_client
@@ -1660,7 +1697,7 @@ where
             Err(err) => {
                 tracing::warn!(
                     "could not read mempool fees from the node, \
-                     deriving them from parent txs instead: {err}"
+                     asking for them tx by tx instead: {err}"
                 );
                 HashMap::new()
             }
@@ -1745,6 +1782,14 @@ where
 
     let res = {
         let inner = {
+            let abandoned = inner.read().await.abandoned_pool.len();
+            if abandoned > 0 {
+                tracing::warn!(
+                    abandoned,
+                    "mempool sync done with txs parked on a parent the node \
+                     could not supply; they stay out of block templates"
+                );
+            }
             let MempoolSyncInner {
                 abandoned_pool,
                 enforcer: _,
@@ -1987,6 +2032,7 @@ mod tests {
         let request_queue = RequestQueue::default();
         let mut txs_needed = LinkedHashSet::new();
         let mut unavailable_txs = HashSet::new();
+        let mut known_fees = HashMap::from([(txid, Amount::from_sat(10_000))]);
 
         // First insertion adds the tx to the mempool.
         {
@@ -1998,7 +2044,7 @@ mod tests {
                 tx_cache: &mut tx_cache,
                 txs_needed: &mut txs_needed,
                 unavailable_txs: &mut unavailable_txs,
-                known_fees: &HashMap::new(),
+                known_fees: &mut known_fees,
                 mempool_txids: &mut HashSet::new(),
             };
             let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
@@ -2030,7 +2076,7 @@ mod tests {
                 tx_cache: &mut tx_cache,
                 txs_needed: &mut txs_needed,
                 unavailable_txs: &mut unavailable_txs,
-                known_fees: &HashMap::new(),
+                known_fees: &mut known_fees,
                 mempool_txids: &mut HashSet::new(),
             };
             let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
@@ -2072,6 +2118,8 @@ mod tests {
             let mut rejected_txs = HashSet::new();
             let mut txs_needed = LinkedHashSet::new();
             let mut unavailable_txs = HashSet::new();
+            let mut known_fees: HashMap<Txid, Amount> =
+                tx_cache.keys().map(|txid| (*txid, Amount::ONE_SAT)).collect();
             let sync_state = SyncStateBorrowedMut {
                 blocks_needed: &mut blocks_needed,
                 rejected_blocks: &mut rejected_blocks,
@@ -2080,7 +2128,7 @@ mod tests {
                 tx_cache: &mut *tx_cache,
                 txs_needed: &mut txs_needed,
                 unavailable_txs: &mut unavailable_txs,
-                known_fees: &HashMap::new(),
+                known_fees: &mut known_fees,
                 mempool_txids: &mut *mempool_txids,
             };
             match try_add_tx_from_caches::<_, DefaultEnforcer>(
@@ -2224,7 +2272,7 @@ mod tests {
             tx_cache: &mut tx_cache,
             txs_needed: &mut txs_needed,
             unavailable_txs: &mut unavailable_txs,
-            known_fees: &HashMap::new(),
+            known_fees: &mut HashMap::new(),
             mempool_txids: &mut mempool_txids,
         };
         let _res = try_add_tx_from_caches::<_, DefaultEnforcer>(
@@ -2506,24 +2554,22 @@ mod tests {
             make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
         let parent_txid = parent.compute_txid();
         let mut sync_state = fresh_sync_state();
-        let fee_known = true;
 
-        // Confirmed parent, fee known: nothing left to fetch it for.
+        // Confirmed parent: nothing to fetch it for.
         assert!(
             !needs_parent_fetch(
                 &sync_state,
                 &HashSet::new(),
-                fee_known,
                 &parent_txid
             ),
-            "a confirmed parent is not fetched once the fee is known"
+            "a confirmed parent is not fetched"
         );
 
         // The same parent, but the node accepted it after startup: it is a
         // mempool parent (dependency state matters) and must be fetched now.
         let live = HashSet::from([parent_txid]);
         assert!(
-            needs_parent_fetch(&sync_state, &live, fee_known, &parent_txid),
+            needs_parent_fetch(&sync_state, &live, &parent_txid),
             "a post-startup mempool parent must be fetched, not read as \
              confirmed from the frozen snapshot"
         );
@@ -2533,14 +2579,12 @@ mod tests {
         assert!(needs_parent_fetch(
             &sync_state,
             &HashSet::new(),
-            fee_known,
             &parent_txid
         ));
         sync_state.tx_cache.insert(parent_txid, parent);
         assert!(!needs_parent_fetch(
             &sync_state,
             &live,
-            fee_known,
             &parent_txid
         ));
     }
@@ -2822,7 +2866,7 @@ mod tests {
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
-                known_fees: &sync_state.known_fees,
+                known_fees: &mut sync_state.known_fees,
                 mempool_txids: &mut sync_state.mempool_txids,
             };
             futures::executor::block_on(connect_block::<_, DefaultEnforcer>(
@@ -2971,7 +3015,7 @@ mod tests {
             tx_cache: &mut sync_state.tx_cache,
             txs_needed: &mut sync_state.txs_needed,
             unavailable_txs: &mut sync_state.unavailable_txs,
-            known_fees: &sync_state.known_fees,
+            known_fees: &mut sync_state.known_fees,
             mempool_txids: &mut sync_state.mempool_txids,
         };
         try_add_tx_from_caches::<_, RejectUntilBlock>(inner, ss, txid)
@@ -2991,7 +3035,7 @@ mod tests {
             tx_cache: &mut sync_state.tx_cache,
             txs_needed: &mut sync_state.txs_needed,
             unavailable_txs: &mut sync_state.unavailable_txs,
-            known_fees: &sync_state.known_fees,
+            known_fees: &mut sync_state.known_fees,
             mempool_txids: &mut sync_state.mempool_txids,
         };
         let reconsider =
@@ -3213,7 +3257,7 @@ mod tests {
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
-                known_fees: &sync_state.known_fees,
+                known_fees: &mut sync_state.known_fees,
                 mempool_txids: &mut sync_state.mempool_txids,
             };
             futures::executor::block_on(connect_block::<_, RejectUntilBlock>(
@@ -3356,7 +3400,7 @@ mod tests {
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
-                known_fees: &sync_state.known_fees,
+                known_fees: &mut sync_state.known_fees,
                 mempool_txids: &mut sync_state.mempool_txids,
             };
             futures::executor::block_on(connect_block::<_, RejectUntilBlock>(
@@ -3659,19 +3703,97 @@ mod tests {
             self.seq(txid, TxHashEvent::Removed).await
         }
 
+        /// Re-drive the action queue, as every stream message does.
+        async fn drive(
+            &mut self,
+        ) -> Result<(), SyncTaskError<DefaultEnforcer>> {
+            while try_apply_next_sync_action(
+                &mut self.inner,
+                &mut self.sync_state,
+            )
+            .await?
+            {}
+            Ok(())
+        }
+
+        /// What `init_sync_mempool` sets up from `getrawmempool`, with
+        /// `known_fees` empty: `getrawmempool verbose` failed or raced.
+        async fn snapshot(
+            &mut self,
+            txids: &[Txid],
+        ) -> Result<(), SyncTaskError<DefaultEnforcer>> {
+            for txid in txids {
+                self.sync_state
+                    .request_queue
+                    .push_back(RequestItem::Tx(*txid, true));
+                self.sync_state.txs_needed.replace(*txid);
+                self.sync_state.mempool_txids.insert(*txid);
+                self.sync_state
+                    .action_queue
+                    .push_back(SyncAction::InsertTx(*txid));
+            }
+            self.drive().await
+        }
+
+        /// A block mining `txs` connects. Mined txs leave the node's mempool
+        /// without a `Removed`, as in Core.
+        async fn connect(
+            &mut self,
+            txs: &[&Transaction],
+        ) -> Result<(), SyncTaskError<DefaultEnforcer>> {
+            let prev = self.inner.unfiltered_mempool.tip;
+            let mut hash = [7u8; 32];
+            hash[0] = self.inner.mempool.chain.blocks.len() as u8;
+            let hash = BlockHash::from_byte_array(hash);
+            {
+                let mut node = self.node.lock();
+                for tx in txs {
+                    let txid = tx.compute_txid();
+                    node.mempool.remove(&txid);
+                    node.confirmed.insert(txid, (*tx).clone());
+                }
+            }
+            let msg = SequenceMessage::BlockHash(BlockHashMessage {
+                block_hash: hash,
+                event: BlockHashEvent::Connected,
+                zmq_seq: 0,
+            });
+            handle_seq_message(&mut self.inner, &mut self.sync_state, msg)?;
+            // The fake node has no `getblock`; answer that request here.
+            self.sync_state
+                .request_queue
+                .remove(&RequestItem::Block(hash));
+            let block = make_resp_block(hash, prev, 1, txs);
+            handle_resp(
+                &mut self.inner,
+                &mut self.sync_state,
+                BatchedResponseItem::Single(ResponseItem::Block(Box::new(
+                    block,
+                ))),
+            )
+            .await
+        }
+
+        /// Serve the next queued request, if any.
+        async fn serve_one(
+            &mut self,
+        ) -> Result<bool, SyncTaskError<DefaultEnforcer>> {
+            let Some(Some(request)) =
+                self.sync_state.request_queue.next().now_or_never()
+            else {
+                return Ok(false);
+            };
+            self.round_trips += 1;
+            let resp = batched_request(&self.client, request).await?;
+            handle_resp(&mut self.inner, &mut self.sync_state, resp).await?;
+            Ok(true)
+        }
+
         /// Serve queued requests until none is left.
         async fn pump(
             &mut self,
         ) -> Result<(), SyncTaskError<DefaultEnforcer>> {
-            while let Some(Some(request)) =
-                self.sync_state.request_queue.next().now_or_never()
-            {
-                self.round_trips += 1;
-                let resp =
-                    batched_request(&self.client, request).await?;
-                handle_resp(&mut self.inner, &mut self.sync_state, resp)
-                    .await?;
-            }
+            while self.serve_one().await? {}
             Ok(())
         }
 
@@ -3702,8 +3824,9 @@ mod tests {
     async fn no_txindex_new_tx_with_confirmed_parent_completes_sync() {
         let (parent, child) = confirmed_parent_and_child();
         let child_txid = child.compute_txid();
+        let parent_txid = parent.compute_txid();
         let mut h = NodeHarness::start(false).await;
-        h.node.lock().confirmed.insert(parent.compute_txid(), parent);
+        h.node.lock().confirmed.insert(parent_txid, parent);
 
         h.node_accepts(&child, 10_000).await.unwrap();
         h.pump().await.unwrap();
@@ -3711,6 +3834,10 @@ mod tests {
         assert!(h.is_synced(), "sync must complete");
         assert!(!h.inner.abandoned_pool.contains(&child_txid));
         assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(10_000)));
+        assert!(
+            !h.node.lock().raw_tx_asked.contains(&parent_txid),
+            "a confirmed parent is not fetched for its fee"
+        );
     }
 
     /// The same arrival on a node with `txindex`: same fee, same mempool.
@@ -3727,5 +3854,345 @@ mod tests {
         assert!(h.is_synced());
         assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(10_000)));
         assert_eq!(h.inner.mempool.txs.0.len(), 1);
+    }
+
+    /// A fee from `getrawmempool verbose` and one from `getmempoolentry` give
+    /// the same mempool entry.
+    #[tokio::test]
+    async fn snapshot_fee_and_entry_fee_give_the_same_result() {
+        let (_parent, child) = confirmed_parent_and_child();
+        let child_txid = child.compute_txid();
+        let fee = Amount::from_sat(10_000);
+
+        let mut from_entry = NodeHarness::start(false).await;
+        from_entry.node_accepts(&child, fee.to_sat()).await.unwrap();
+        from_entry.pump().await.unwrap();
+
+        let mut from_snapshot = NodeHarness::start(false).await;
+        from_snapshot.sync_state.known_fees.insert(child_txid, fee);
+        from_snapshot.node_accepts(&child, fee.to_sat()).await.unwrap();
+        from_snapshot.pump().await.unwrap();
+        assert!(
+            from_snapshot.node.lock().entry_asked.is_empty(),
+            "a fee already known is not asked for again"
+        );
+
+        assert_eq!(from_entry.fee_of(&child_txid), Some(fee));
+        assert_eq!(
+            from_entry.fee_of(&child_txid),
+            from_snapshot.fee_of(&child_txid)
+        );
+    }
+
+    /// `-5`: the tx is gone. It is not admitted, nothing is left waiting, and
+    /// the `Removed` that follows applies cleanly.
+    #[tokio::test]
+    async fn entry_not_found_means_left_the_mempool() {
+        let (parent, child) = confirmed_parent_and_child();
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node.lock().confirmed.insert(parent.compute_txid(), parent);
+
+        h.node_accepts(&child, 10_000).await.unwrap();
+        h.serve_one().await.unwrap(); // the tx's bytes
+        // Gone from the node, its `Removed` still on the wire.
+        h.node.lock().mempool.remove(&child_txid);
+        h.pump().await.unwrap();
+
+        assert_eq!(h.fee_of(&child_txid), None, "never admitted");
+        assert!(h.sync_state.unavailable_txs.contains(&child_txid));
+        assert!(h.is_synced(), "nothing waits on a tx that left");
+
+        h.seq(child_txid, TxHashEvent::Removed).await.unwrap();
+        assert!(h.is_synced());
+        assert!(!h.inner.unfiltered_mempool.txs.contains(&child_txid));
+    }
+
+    /// Any other failure says nothing about the tx: it surfaces as an error,
+    /// the tx is not marked gone and is not admitted at any fee.
+    #[tokio::test]
+    async fn transient_entry_error_is_not_gone() {
+        let (parent, child) = confirmed_parent_and_child();
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node.lock().confirmed.insert(parent.compute_txid(), parent);
+        h.node.lock().entry_error = Some(-28); // RPC_IN_WARMUP
+
+        h.node_accepts(&child, 10_000).await.unwrap();
+        let err = h.pump().await.expect_err("must surface");
+        assert!(
+            matches!(
+                err,
+                SyncTaskError::Request(RequestError::JsonRpc {
+                    method: "getmempoolentry",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert!(!h.sync_state.unavailable_txs.contains(&child_txid));
+        assert_eq!(h.fee_of(&child_txid), None);
+        assert!(!h.is_synced(), "the tx is still waiting for its fee");
+
+        // The node recovers: the same tx is admitted, at its real fee.
+        h.node.lock().entry_error = None;
+        h.drive().await.unwrap();
+        h.pump().await.unwrap();
+        assert!(h.is_synced());
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(10_000)));
+    }
+
+    /// A `Removed` overtakes the fee fetch and cancels it: the queue head must
+    /// not sit waiting for an answer that will never come (the apply timeout
+    /// would kill the task).
+    #[tokio::test]
+    async fn removal_while_fee_is_pending_does_not_stall() {
+        let (parent, child) = confirmed_parent_and_child();
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node.lock().confirmed.insert(parent.compute_txid(), parent);
+
+        h.node_accepts(&child, 10_000).await.unwrap();
+        h.serve_one().await.unwrap(); // the tx's bytes
+        h.node_drops(child_txid).await.unwrap();
+        h.pump().await.unwrap();
+
+        assert!(h.is_synced());
+        assert_eq!(h.fee_of(&child_txid), None);
+        assert!(!h.sync_state.known_fees.contains_key(&child_txid));
+    }
+
+    /// A burst costs one call per batch, not one per tx.
+    #[tokio::test]
+    async fn burst_of_new_txs_is_batched_with_right_fees() {
+        const BURST: u64 = 2_500;
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node.lock().confirmed.insert(parent_txid, parent);
+
+        let mut txs = Vec::new();
+        for i in 0..BURST {
+            let fee = 1_000 + i;
+            let tx = make_tx(&[OutPoint::new(parent_txid, 0)], &[100_000 - fee]);
+            h.node_accepts(&tx, fee).await.unwrap();
+            txs.push((tx.compute_txid(), fee));
+        }
+        h.pump().await.unwrap();
+
+        assert!(h.is_synced());
+        for (txid, fee) in &txs {
+            assert_eq!(h.fee_of(txid), Some(Amount::from_sat(*fee)));
+        }
+        // 3 `getrawtransaction` + 3 `getmempoolentry` batches of up to 1,000.
+        assert_eq!(h.round_trips, 6, "batched, not per tx");
+        assert_eq!(h.node.lock().entry_asked.len(), BURST as usize);
+        assert!(!h.node.lock().raw_tx_asked.contains(&parent_txid));
+    }
+
+    /// Unconfirmed chain in announcement order: parent, then child.
+    #[tokio::test]
+    async fn unconfirmed_chain_parent_announced_first() {
+        let (grandparent, parent) = confirmed_parent_and_child();
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[85_000]);
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node
+            .lock()
+            .confirmed
+            .insert(grandparent.compute_txid(), grandparent);
+
+        h.node_accepts(&parent, 10_000).await.unwrap();
+        h.node_accepts(&child, 5_000).await.unwrap();
+        h.pump().await.unwrap();
+
+        assert!(h.is_synced());
+        assert_eq!(h.fee_of(&parent_txid), Some(Amount::from_sat(10_000)));
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(5_000)));
+        let (_tx, info) = &h.inner.mempool.txs.0[&child_txid];
+        assert!(info.depends.contains(&parent_txid), "package kept");
+        assert_eq!(info.fees.ancestor, Amount::from_sat(15_000));
+    }
+
+    /// Unconfirmed chain out of order, as a snapshot can list it: the child
+    /// comes first and must wait for its parent, never go in as an orphan.
+    #[tokio::test]
+    async fn unconfirmed_chain_child_listed_before_parent() {
+        let (grandparent, parent) = confirmed_parent_and_child();
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[85_000]);
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        {
+            let mut node = h.node.lock();
+            node.confirmed.insert(grandparent.compute_txid(), grandparent);
+            node.mempool
+                .insert(parent_txid, (parent, Amount::from_sat(10_000)));
+            node.mempool
+                .insert(child_txid, (child, Amount::from_sat(5_000)));
+        }
+        h.snapshot(&[child_txid, parent_txid]).await.unwrap();
+        h.pump().await.unwrap();
+
+        assert!(h.is_synced());
+        assert_eq!(h.fee_of(&parent_txid), Some(Amount::from_sat(10_000)));
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(5_000)));
+        let (_tx, info) = &h.inner.mempool.txs.0[&child_txid];
+        assert!(info.depends.contains(&parent_txid), "no rootless orphan");
+    }
+
+    /// The edge case left: the node's mirror says a parent is in the mempool,
+    /// the node cannot supply it. Sync still ends. The child stays out of the
+    /// mempool until the node settles it, here by removing it.
+    #[tokio::test]
+    async fn genuinely_unavailable_parent_ends_sync_child_left_out() {
+        let (_grandparent, parent) = confirmed_parent_and_child();
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[85_000]);
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        // The node has the child but no longer the parent.
+        h.node
+            .lock()
+            .mempool
+            .insert(child_txid, (child, Amount::from_sat(5_000)));
+        h.snapshot(&[parent_txid, child_txid]).await.unwrap();
+        h.pump().await.unwrap();
+
+        assert!(h.is_synced(), "a parked tx must not hold sync open");
+        assert!(h.inner.abandoned_pool.contains(&child_txid));
+        assert_eq!(h.fee_of(&child_txid), None, "left out, not invented");
+
+        h.node_drops(child_txid).await.unwrap();
+        assert!(!h.inner.abandoned_pool.contains(&child_txid));
+        assert!(h.is_synced());
+    }
+
+    /// The same parked child, then mined. No `Removed` ever comes for a mined
+    /// tx, so the block has to clear it.
+    #[tokio::test]
+    async fn parked_child_mined_leaves_the_abandoned_pool() {
+        let (_grandparent, parent) = confirmed_parent_and_child();
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[85_000]);
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node
+            .lock()
+            .mempool
+            .insert(child_txid, (child.clone(), Amount::from_sat(5_000)));
+        h.snapshot(&[parent_txid, child_txid]).await.unwrap();
+        h.pump().await.unwrap();
+        assert!(h.inner.abandoned_pool.contains(&child_txid));
+
+        h.connect(&[&child]).await.unwrap();
+
+        assert!(!h.inner.abandoned_pool.contains(&child_txid));
+        assert_eq!(h.fee_of(&child_txid), None);
+        assert!(h.is_synced());
+    }
+
+    /// A parked child whose parent gets mined is back in, at its real fee.
+    #[tokio::test]
+    async fn parked_child_returns_when_parent_is_mined() {
+        let (grandparent, parent) = confirmed_parent_and_child();
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[85_000]);
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node
+            .lock()
+            .confirmed
+            .insert(grandparent.compute_txid(), grandparent);
+        h.node
+            .lock()
+            .mempool
+            .insert(child_txid, (child, Amount::from_sat(5_000)));
+        h.snapshot(&[parent_txid, child_txid]).await.unwrap();
+        h.pump().await.unwrap();
+        assert!(h.inner.abandoned_pool.contains(&child_txid));
+
+        h.connect(&[&parent]).await.unwrap();
+        h.pump().await.unwrap();
+
+        assert!(h.inner.abandoned_pool.is_empty());
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(5_000)));
+        assert!(h.is_synced());
+    }
+
+    /// The block's response comes first, then the tx's fee answers -5 because
+    /// that block mined it. A later child of that tx spends a confirmed coin:
+    /// a leftover `unavailable` mark would park it for good.
+    #[tokio::test]
+    async fn gone_because_mined_leaves_no_stale_unavailable_mark() {
+        let (grandparent, parent) = confirmed_parent_and_child();
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[85_000]);
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node
+            .lock()
+            .confirmed
+            .insert(grandparent.compute_txid(), grandparent);
+
+        h.node_accepts(&parent, 10_000).await.unwrap();
+        h.serve_one().await.unwrap(); // the parent's bytes
+        // Queue: Added(parent), Connected(block). The block's response goes
+        // first; the node has already dropped the parent.
+        h.node.lock().mempool.remove(&parent_txid);
+        h.connect(&[&parent]).await.unwrap();
+        h.pump().await.unwrap();
+        assert!(
+            !h.sync_state.unavailable_txs.contains(&parent_txid),
+            "the mark goes with the block"
+        );
+        assert_eq!(h.fee_of(&parent_txid), None);
+
+        h.node_accepts(&child, 5_000).await.unwrap();
+        h.pump().await.unwrap();
+
+        assert!(h.is_synced());
+        assert!(!h.inner.abandoned_pool.contains(&child_txid));
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(5_000)));
+    }
+
+    /// Removed, then announced again while the bytes are still cached: the
+    /// old `unavailable` mark must not end the new insert as "left".
+    #[tokio::test]
+    async fn readded_cached_tx_is_admitted() {
+        let (_parent, child) = confirmed_parent_and_child();
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+
+        h.node_accepts(&child, 10_000).await.unwrap();
+        h.pump().await.unwrap();
+        assert!(h.fee_of(&child_txid).is_some());
+
+        h.node_drops(child_txid).await.unwrap();
+        assert_eq!(h.fee_of(&child_txid), None);
+        assert!(!h.sync_state.known_fees.contains_key(&child_txid));
+
+        h.node_accepts(&child, 10_000).await.unwrap();
+        h.pump().await.unwrap();
+        assert!(h.is_synced());
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(10_000)));
+    }
+
+    /// `known_fees` now grows with every arrival, so it must shrink as well.
+    #[tokio::test]
+    async fn known_fees_forgets_mined_txs() {
+        let (_parent, child) = confirmed_parent_and_child();
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node_accepts(&child, 10_000).await.unwrap();
+        h.pump().await.unwrap();
+        assert!(h.sync_state.known_fees.contains_key(&child_txid));
+
+        h.connect(&[&child]).await.unwrap();
+
+        assert!(!h.sync_state.known_fees.contains_key(&child_txid));
+        assert_eq!(h.fee_of(&child_txid), None);
     }
 }

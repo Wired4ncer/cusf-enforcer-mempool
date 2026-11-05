@@ -5,11 +5,11 @@ use std::{
     time::Instant,
 };
 
-use bitcoin::{BlockHash, Transaction, Txid};
+use bitcoin::{Amount, BlockHash, Transaction, Txid};
 use bitcoin_jsonrpsee::{
     client::{
         GetBlockClient as _, GetRawTransactionClient as _,
-        GetRawTransactionVerbose, U8Witness,
+        GetRawTransactionVerbose, RawMempoolTxInfo, U8Witness,
     },
     jsonrpsee::{
         core::{
@@ -54,6 +54,8 @@ enum RequestItem {
     /// Bool indicating if the tx is a mempool tx.
     /// `false` if the tx is needed as a dependency for a mempool tx
     Tx(Txid, bool),
+    /// A mempool tx's fee, from `getmempoolentry`
+    Fee(Txid),
 }
 
 /// Batched items requested while syncing
@@ -64,6 +66,7 @@ enum BatchedRequestItem {
     /// Bool indicating if the tx is a mempool tx.
     /// `false` if the tx is needed as a dependency for a mempool tx
     BatchTx(NonEmpty<(Txid, bool)>),
+    BatchFee(NonEmpty<Txid>),
     Single(RequestItem),
 }
 
@@ -80,6 +83,9 @@ impl BatchedRequestItem {
             Self::Single(RequestItem::RejectBlock(_)) => "invalidateblock",
             Self::BatchTx(_) | Self::Single(RequestItem::Tx(..)) => {
                 "getrawtransaction"
+            }
+            Self::BatchFee(_) | Self::Single(RequestItem::Fee(_)) => {
+                "getmempoolentry"
             }
             Self::Single(RequestItem::Block(_)) => "getblock",
         }
@@ -109,7 +115,10 @@ impl RequestItem {
         match self {
             Self::RejectTx(txid) => Some(Self::UnrejectTx(*txid)),
             Self::UnrejectTx(txid) => Some(Self::RejectTx(*txid)),
-            Self::Block(_) | Self::RejectBlock(_) | Self::Tx(..) => None,
+            Self::Block(_)
+            | Self::RejectBlock(_)
+            | Self::Tx(..)
+            | Self::Fee(_) => None,
         }
     }
 }
@@ -219,6 +228,18 @@ impl Stream for RequestQueue {
                     BatchedRequestItem::BatchTx(txids)
                 };
                 Poll::Ready(Some(batched_request))
+            }
+            Some(RequestItem::Fee(txid)) => {
+                let mut txids = NonEmpty::new(txid);
+                while txids.len() < MAX_TX_REQUESTS_PER_BATCH {
+                    let Some(&RequestItem::Fee(txid)) = queue_lock.front()
+                    else {
+                        break;
+                    };
+                    queue_lock.pop_front();
+                    txids.push(txid);
+                }
+                Poll::Ready(Some(BatchedRequestItem::BatchFee(txids)))
             }
             None => Poll::Pending,
         }
@@ -454,10 +475,17 @@ enum BatchedResponseItem {
         /// strand every tx that was batched with the one that lost.
         unavailable: Vec<Txid>,
     },
+    /// The outcome of a `getmempoolentry` fetch.
+    BatchFee {
+        /// `fees.base`, the same value `getrawmempool verbose` reports.
+        fees: Vec<(Txid, Amount)>,
+        /// Members the node no longer holds, see [`fee_fetch_result`].
+        gone: Vec<Txid>,
+    },
     Single(ResponseItem),
 }
 
-/// What Core answers `getrawtransaction` with when it has
+/// What Core answers `getrawtransaction` and `getmempoolentry` with when it has
 /// never heard of the tx, or no longer has it.
 const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
 
@@ -494,6 +522,25 @@ fn tx_fetch_result(
                 })?;
             Ok(Some(tx))
         }
+        Err(err) if err.code() == RPC_INVALID_ADDRESS_OR_KEY => Ok(None),
+        Err(err) => Err(RequestError::JsonRpc {
+            method,
+            source: JsonRpcError::from(err.into_owned()),
+        }),
+    }
+}
+
+/// One member of a `getmempoolentry` fetch.
+///
+/// `Ok(None)` is [`RPC_INVALID_ADDRESS_OR_KEY`]: the tx left the node's mempool.
+/// Any other failure says nothing about the tx and is an error like every other
+/// failed RPC here, so a node having a bad moment never costs a tx its place.
+fn fee_fetch_result(
+    method: &'static str,
+    entry: Result<RawMempoolTxInfo, ErrorObject<'_>>,
+) -> Result<Option<Amount>, RequestError> {
+    match entry {
+        Ok(info) => Ok(Some(info.fees.base)),
         Err(err) if err.code() == RPC_INVALID_ADDRESS_OR_KEY => Ok(None),
         Err(err) => Err(RequestError::JsonRpc {
             method,
@@ -602,6 +649,12 @@ where
                 unavailable,
             })
         }
+        BatchedRequestItem::BatchFee(txids) => {
+            fee_batch(rpc_client, method, txids).await
+        }
+        BatchedRequestItem::Single(RequestItem::Fee(txid)) => {
+            fee_batch(rpc_client, method, NonEmpty::new(txid)).await
+        }
         BatchedRequestItem::Single(RequestItem::Block(block_hash)) => {
             let block = rpc_client
                 .get_block(block_hash, U8Witness::<2>)
@@ -656,6 +709,39 @@ where
             })
         }
     }
+}
+
+/// A batch even for one tx: entries come back in request order, so the failure
+/// of one member can be told from the others.
+async fn fee_batch<RpcClient>(
+    rpc_client: &RpcClient,
+    method: &'static str,
+    txids: NonEmpty<Txid>,
+) -> Result<BatchedResponseItem, RequestError>
+where
+    RpcClient: bitcoin_jsonrpsee::client::MainClient + Sync,
+{
+    let mut request = BatchRequestBuilder::new();
+    for txid in txids.iter().copied() {
+        let mut params = ArrayParams::new();
+        params.insert(txid).unwrap();
+        request.insert(method, params).unwrap();
+    }
+    let resp = rpc_client
+        .batch_request::<RawMempoolTxInfo>(request)
+        // Must box due to https://github.com/rust-lang/rust/issues/100013
+        .boxed()
+        .await
+        .map_err(|e| RequestError::JsonRpc { method, source: e })?;
+    let mut fees = Vec::with_capacity(txids.len());
+    let mut gone = Vec::new();
+    for (txid, entry) in txids.iter().copied().zip(resp) {
+        match fee_fetch_result(method, entry)? {
+            Some(fee) => fees.push((txid, fee)),
+            None => gone.push(txid),
+        }
+    }
+    Ok(BatchedResponseItem::BatchFee { fees, gone })
 }
 
 type ResponseStreamItem = Result<BatchedResponseItem, RequestError>;
