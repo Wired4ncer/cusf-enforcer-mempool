@@ -1914,6 +1914,7 @@ mod tests {
         TxOut, Txid, Witness, absolute::LockTime, hashes::Hash as _,
         transaction::Version,
     };
+    use futures::{FutureExt as _, StreamExt as _};
     use hashlink::LinkedHashSet;
 
     use super::*;
@@ -3432,5 +3433,299 @@ mod tests {
         );
         assert!(sync_state.action_queue.is_empty());
         assert!(sync_state.rejected_txs.is_empty());
+    }
+
+    /// A node over real JSON-RPC, in process: what a `getrawtransaction` and a
+    /// `getmempoolentry` really answer with or without `txindex`.
+    mod fake_node {
+        use std::sync::Arc;
+
+        use bitcoin::{Amount, Transaction, Txid, Wtxid};
+        use bitcoin_jsonrpsee::{
+            http_client::{HttpClient, HttpClientBuilder},
+            jsonrpsee::{
+                RpcModule,
+                server::{Server, ServerHandle},
+                types::ErrorObjectOwned,
+            },
+        };
+        use parking_lot::Mutex;
+        use serde::Serialize;
+
+        use std::collections::HashMap;
+
+        #[derive(Default)]
+        pub struct FakeNode {
+            pub txindex: bool,
+            pub mempool: HashMap<Txid, (Transaction, Amount)>,
+            pub confirmed: HashMap<Txid, Transaction>,
+            /// Every `getmempoolentry` answers with this code while set.
+            pub entry_error: Option<i32>,
+            /// Txids asked of `getrawtransaction`, in order.
+            pub raw_tx_asked: Vec<Txid>,
+            /// Txids asked of `getmempoolentry`, in order.
+            pub entry_asked: Vec<Txid>,
+        }
+
+        #[derive(Clone, Serialize)]
+        struct Fees {
+            #[serde(with = "bitcoin::amount::serde::as_btc")]
+            base: Amount,
+            #[serde(with = "bitcoin::amount::serde::as_btc")]
+            modified: Amount,
+            #[serde(with = "bitcoin::amount::serde::as_btc")]
+            ancestor: Amount,
+            #[serde(with = "bitcoin::amount::serde::as_btc")]
+            descendant: Amount,
+        }
+
+        #[derive(Clone, Serialize)]
+        struct Entry {
+            vsize: u64,
+            weight: u64,
+            descendantcount: u64,
+            descendantsize: u64,
+            ancestorcount: u64,
+            ancestorsize: u64,
+            wtxid: Wtxid,
+            fees: Fees,
+            depends: Vec<Txid>,
+            spentby: Vec<Txid>,
+            unbroadcast: bool,
+        }
+
+        const NOT_FOUND: i32 = -5;
+
+        pub async fn start(
+            node: Arc<Mutex<FakeNode>>,
+        ) -> (HttpClient, ServerHandle) {
+            let server = Server::builder()
+                .build("127.0.0.1:0")
+                .await
+                .expect("bind fake node");
+            let addr = server.local_addr().expect("fake node addr");
+            let mut module = RpcModule::new(node);
+            module
+                .register_method("getrawtransaction", |params, ctx, _| {
+                    let txid: Txid = params.sequence().next()?;
+                    let mut node = ctx.lock();
+                    node.raw_tx_asked.push(txid);
+                    let tx = node
+                        .mempool
+                        .get(&txid)
+                        .map(|(tx, _)| tx)
+                        .or(node.confirmed.get(&txid).filter(|_| node.txindex));
+                    match tx {
+                        Some(tx) => {
+                            Ok(bitcoin::consensus::encode::serialize_hex(tx))
+                        }
+                        None => Err(ErrorObjectOwned::owned::<()>(
+                            NOT_FOUND,
+                            "No such mempool transaction. Use -txindex or \
+                             provide a block hash",
+                            None,
+                        )),
+                    }
+                })
+                .unwrap();
+            module
+                .register_method("getmempoolentry", |params, ctx, _| {
+                    let txid: Txid = params.sequence().next()?;
+                    let mut node = ctx.lock();
+                    node.entry_asked.push(txid);
+                    if let Some(code) = node.entry_error {
+                        return Err(ErrorObjectOwned::owned::<()>(
+                            code,
+                            "fake node failing on purpose",
+                            None,
+                        ));
+                    }
+                    match node.mempool.get(&txid) {
+                        Some((tx, fee)) => Ok(Entry {
+                            vsize: tx.vsize() as u64,
+                            weight: tx.weight().to_wu(),
+                            descendantcount: 1,
+                            descendantsize: 1,
+                            ancestorcount: 1,
+                            ancestorsize: 1,
+                            wtxid: tx.compute_wtxid(),
+                            fees: Fees {
+                                base: *fee,
+                                modified: *fee,
+                                ancestor: *fee,
+                                descendant: *fee,
+                            },
+                            depends: Vec::new(),
+                            spentby: Vec::new(),
+                            unbroadcast: false,
+                        }),
+                        None => Err(ErrorObjectOwned::owned::<()>(
+                            NOT_FOUND,
+                            "Transaction not in mempool",
+                            None,
+                        )),
+                    }
+                })
+                .unwrap();
+            let handle = server.start(module);
+            let client = HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .expect("fake node client");
+            (client, handle)
+        }
+    }
+
+    /// The sync task's loop, minus ZMQ: sequence messages are handed in, and
+    /// every queued request goes to the node through the real
+    /// [`batched_request`] until the queue runs dry.
+    struct NodeHarness {
+        node: Arc<parking_lot::Mutex<fake_node::FakeNode>>,
+        client: bitcoin_jsonrpsee::http_client::HttpClient,
+        _server: bitcoin_jsonrpsee::jsonrpsee::server::ServerHandle,
+        inner: MempoolSyncInner<DefaultEnforcer>,
+        sync_state: SyncState,
+        mempool_seq: u64,
+        round_trips: usize,
+    }
+
+    impl NodeHarness {
+        async fn start(txindex: bool) -> Self {
+            let node = Arc::new(parking_lot::Mutex::new(fake_node::FakeNode {
+                txindex,
+                ..Default::default()
+            }));
+            let (client, _server) = fake_node::start(node.clone()).await;
+            Self {
+                node,
+                client,
+                _server,
+                inner: fresh_inner(),
+                sync_state: fresh_sync_state(),
+                mempool_seq: 0,
+                round_trips: 0,
+            }
+        }
+
+        fn is_synced(&self) -> bool {
+            MempoolSyncingBorrowed {
+                inner: &self.inner,
+                sync_state: &self.sync_state,
+            }
+            .is_synced()
+        }
+
+        async fn seq(
+            &mut self,
+            txid: Txid,
+            event: TxHashEvent,
+        ) -> Result<(), SyncTaskError<DefaultEnforcer>> {
+            self.mempool_seq += 1;
+            let msg = SequenceMessage::TxHash(TxHashMessage {
+                txid,
+                event,
+                mempool_seq: self.mempool_seq,
+                zmq_seq: 0,
+            });
+            handle_seq_message(&mut self.inner, &mut self.sync_state, msg)?;
+            while try_apply_next_sync_action(
+                &mut self.inner,
+                &mut self.sync_state,
+            )
+            .await?
+            {}
+            Ok(())
+        }
+
+        /// The node accepts `tx` and announces it.
+        async fn node_accepts(
+            &mut self,
+            tx: &Transaction,
+            fee_sat: u64,
+        ) -> Result<(), SyncTaskError<DefaultEnforcer>> {
+            let txid = tx.compute_txid();
+            self.node
+                .lock()
+                .mempool
+                .insert(txid, (tx.clone(), Amount::from_sat(fee_sat)));
+            self.seq(txid, TxHashEvent::Added).await
+        }
+
+        /// The node drops `tx` and announces it.
+        async fn node_drops(
+            &mut self,
+            txid: Txid,
+        ) -> Result<(), SyncTaskError<DefaultEnforcer>> {
+            self.node.lock().mempool.remove(&txid);
+            self.seq(txid, TxHashEvent::Removed).await
+        }
+
+        /// Serve queued requests until none is left.
+        async fn pump(
+            &mut self,
+        ) -> Result<(), SyncTaskError<DefaultEnforcer>> {
+            while let Some(Some(request)) =
+                self.sync_state.request_queue.next().now_or_never()
+            {
+                self.round_trips += 1;
+                let resp =
+                    batched_request(&self.client, request).await?;
+                handle_resp(&mut self.inner, &mut self.sync_state, resp)
+                    .await?;
+            }
+            Ok(())
+        }
+
+        fn fee_of(&self, txid: &Txid) -> Option<Amount> {
+            self.inner
+                .mempool
+                .txs
+                .0
+                .get(txid)
+                .map(|(_tx, info)| info.fees.base)
+        }
+    }
+
+    /// A tx in a block, and a tx in the node's mempool spending it.
+    fn confirmed_parent_and_child() -> (Transaction, Transaction) {
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let child =
+            make_tx(&[OutPoint::new(parent.compute_txid(), 0)], &[90_000]);
+        (parent, child)
+    }
+
+    /// The standby's stall, 2026-11-05 (`prune=40000 txindex=0`): a tx the
+    /// node accepted after startup is not in `known_fees`. Its confirmed
+    /// parent cannot be fetched without `txindex`; the child must not depend
+    /// on that.
+    #[tokio::test]
+    async fn no_txindex_new_tx_with_confirmed_parent_completes_sync() {
+        let (parent, child) = confirmed_parent_and_child();
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node.lock().confirmed.insert(parent.compute_txid(), parent);
+
+        h.node_accepts(&child, 10_000).await.unwrap();
+        h.pump().await.unwrap();
+
+        assert!(h.is_synced(), "sync must complete");
+        assert!(!h.inner.abandoned_pool.contains(&child_txid));
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(10_000)));
+    }
+
+    /// The same arrival on a node with `txindex`: same fee, same mempool.
+    #[tokio::test]
+    async fn txindex_new_tx_with_confirmed_parent_same_result() {
+        let (parent, child) = confirmed_parent_and_child();
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(true).await;
+        h.node.lock().confirmed.insert(parent.compute_txid(), parent);
+
+        h.node_accepts(&child, 10_000).await.unwrap();
+        h.pump().await.unwrap();
+
+        assert!(h.is_synced());
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(10_000)));
+        assert_eq!(h.inner.mempool.txs.0.len(), 1);
     }
 }
