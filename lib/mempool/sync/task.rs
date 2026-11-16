@@ -4296,4 +4296,95 @@ mod tests {
         }
         assert!(h.sync_state.known_fees.contains_key(&child_txid));
     }
+
+    /// A parent mined two blocks deep, a reorg, a child that never left the
+    /// mempool. The parent has to re-enter on its kept fee alone: a fee call
+    /// would release the lock with the child in the mempool and the parent
+    /// not, and a template holding the child without its parent is one the
+    /// node rejects (review 2026-11-05). The fake node fails every
+    /// `getmempoolentry`, so a fee call would show as an error.
+    #[tokio::test]
+    async fn reorg_returns_a_mined_parent_on_its_kept_fee_without_a_fee_call() {
+        let (grandparent, parent) = confirmed_parent_and_child();
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[85_000]);
+        let child_txid = child.compute_txid();
+        let mut h = NodeHarness::start(false).await;
+        h.node
+            .lock()
+            .confirmed
+            .insert(grandparent.compute_txid(), grandparent);
+
+        // 1. Parent and child in the mempool, fees known.
+        h.node_accepts(&parent, 10_000).await.unwrap();
+        h.node_accepts(&child, 5_000).await.unwrap();
+        h.pump().await.unwrap();
+        assert_eq!(h.fee_of(&parent_txid), Some(Amount::from_sat(10_000)));
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(5_000)));
+
+        // 2. The parent is mined in B1, the child stays; B2 on top of it.
+        h.connect(&[&parent]).await.unwrap();
+        let b1 = h.inner.unfiltered_mempool.tip;
+        h.connect(&[]).await.unwrap();
+        let b2 = h.inner.unfiltered_mempool.tip;
+        assert_ne!(b1, b2);
+        assert_eq!(h.fee_of(&parent_txid), None);
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(5_000)));
+
+        // The fake node has no `getblock`: hand over B1's parent here.
+        let genesis = BlockHash::all_zeros();
+        h.inner
+            .mempool
+            .chain
+            .blocks
+            .insert(genesis, make_resp_block(genesis, genesis, 0, &[]));
+
+        // 4. From here on the node answers no fee call.
+        h.node.lock().entry_error = Some(-28);
+        h.node.lock().entry_asked.clear();
+
+        // 3. The reorg: B2 and B1 disconnect, the node takes the parent back.
+        for block_hash in [b2, b1] {
+            h.mempool_seq += 1;
+            let msg = SequenceMessage::BlockHash(BlockHashMessage {
+                block_hash,
+                event: BlockHashEvent::Disconnected,
+                zmq_seq: 0,
+            });
+            handle_seq_message(&mut h.inner, &mut h.sync_state, msg).unwrap();
+            h.drive().await.unwrap();
+        }
+        assert_eq!(h.fee_of(&parent_txid), None, "not announced yet");
+        h.node
+            .lock()
+            .mempool
+            .insert(parent_txid, (parent.clone(), Amount::from_sat(10_000)));
+        h.seq(parent_txid, TxHashEvent::Added).await.unwrap();
+        h.pump().await.unwrap();
+
+        // 5. The parent is back at its fee, with no fee call, and the block
+        // template the child is proposed in holds the parent before it.
+        assert_eq!(h.fee_of(&parent_txid), Some(Amount::from_sat(10_000)));
+        assert_eq!(h.fee_of(&child_txid), Some(Amount::from_sat(5_000)));
+        assert!(
+            h.node.lock().entry_asked.is_empty(),
+            "no fee call: {:?}",
+            h.node.lock().entry_asked
+        );
+        assert!(h.is_synced());
+        let template: Vec<Txid> = h
+            .inner
+            .mempool
+            .propose_txs(None)
+            .unwrap()
+            .iter()
+            .map(|t| t.txid)
+            .collect();
+        let parent_at = template.iter().position(|t| *t == parent_txid);
+        let child_at = template.iter().position(|t| *t == child_txid);
+        assert!(
+            parent_at.is_some() && parent_at < child_at,
+            "parent before child in the template: {template:?}"
+        );
+    }
 }
